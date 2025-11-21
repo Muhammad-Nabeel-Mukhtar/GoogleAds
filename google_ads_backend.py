@@ -14,7 +14,7 @@ import os
 app = Flask(__name__)
 
 # Path to your Google Ads YAML config (keep outside public repo)
-GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "config/google-ads.yaml")
+GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 # Permanent MCC Customer ID for account creation—do not expose via frontend
 MCC_CUSTOMER_ID = '1331285009'
 
