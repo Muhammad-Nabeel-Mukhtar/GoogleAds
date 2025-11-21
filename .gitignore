@@ -1,0 +1,6 @@
+# Ignore sensitive config and environment files
+config/google-ads.yaml
+*.pyc
+__pycache__/
+venv/
+.env
