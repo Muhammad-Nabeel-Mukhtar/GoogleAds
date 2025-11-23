@@ -5,6 +5,7 @@ Google Ads Backend API
 """
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <-- Add CORS support
 from google.ads.googleads.client import GoogleAdsClient
 import time
 import socket
@@ -13,9 +14,12 @@ import os
 
 app = Flask(__name__)
 
-# Path to your Google Ads YAML config (keep outside public repo)
+# Enable CORS (specify your frontend domain for production security)
+CORS(app, origins=["https://lightning-ads-dashboard-upp.vercel.app"])
+# For full public dev/test access: CORS(app) (not recommended for production!)
+
+# Google Ads config path—expects secret file named google-ads.yaml in root
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
-# Permanent MCC Customer ID for account creation—do not expose via frontend
 MCC_CUSTOMER_ID = '1331285009'
 
 def is_network_error(e):
