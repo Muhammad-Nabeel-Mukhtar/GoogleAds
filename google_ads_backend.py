@@ -15,7 +15,7 @@ import os
 app = Flask(__name__)
 
 # Enable CORS (specify your frontend domain for production security)
-CORS(app, origins=["https://lightning-ads-dashboard-upp.vercel.app"])
+CORS(app)
 # For full public dev/test access: CORS(app) (not recommended for production!)
 
 # Google Ads config path—expects secret file named google-ads.yaml in root
