@@ -1,11 +1,5 @@
-"""
-Google Ads Backend API
-- POST /create-account: Create a new client under your MCC
-- GET  /list-linked-accounts?mcc_id=...: List all client accounts of any MCC
-"""
-
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # <-- Add CORS support
+from flask_cors import CORS
 from google.ads.googleads.client import GoogleAdsClient
 import time
 import socket
@@ -13,12 +7,8 @@ import re
 import os
 
 app = Flask(__name__)
-
-# Enable CORS (specify your frontend domain for production security)
 CORS(app)
-# For full public dev/test access: CORS(app) (not recommended for production!)
 
-# Google Ads config path—expects secret file named google-ads.yaml in root
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 MCC_CUSTOMER_ID = '1331285009'
 
@@ -43,6 +33,7 @@ def create_account():
     timezone = data.get('timezone', '').strip()
     tracking_url = data.get('tracking_url')
     final_url_suffix = data.get('final_url_suffix')
+    email = data.get('email', '').strip()
 
     errors = []
     if not (1 <= len(name) <= 100 and all(c.isprintable() and c not in "<>/" for c in name)):
@@ -50,7 +41,9 @@ def create_account():
     if not re.match(r"^[A-Z]{3}$", currency):
         errors.append("Currency must be a 3-letter currency code, e.g. USD, PKR.")
     if not (timezone and all(x != '' for x in timezone.split('/')) and 3 <= len(timezone) <= 50):
-        errors.append("Time zone must be a valid string, e.g. Asia/Karachi. See https://developers.google.com/google-ads/api/reference/data/codes-formats#timezone-ids")
+        errors.append("Time zone must be a valid string, e.g. Asia/Karachi.")
+    if not email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        errors.append("Valid access email is required.")
     if errors:
         return jsonify({"success": False, "errors": errors, "accounts": []}), 400
 
@@ -71,10 +64,26 @@ def create_account():
                 customer_client=customer
             )
             customer_id = response.resource_name.split('/')[-1]
+
+            # AUTOMATE USER INVITATION TO CLIENT ACCOUNT (Role is statically READ_ONLY)
+            invitation_service = client.get_service("CustomerUserAccessInvitationService")
+            invitation_operation = client.get_type("CustomerUserAccessInvitationOperation")
+            invitation = invitation_operation.create
+            invitation.email_address = email
+            invitation.access_role = "READ_ONLY"
+            # Send Invite
+            invitation_response = invitation_service.mutate_customer_user_access_invitation(
+                customer_id=customer_id,
+                operation=invitation_operation
+            )
+
             return jsonify({
                 "success": True,
                 "resource_name": response.resource_name,
                 "customer_id": customer_id,
+                "invite_sent": True,
+                "invited_email": email,
+                "role": "READ_ONLY",
                 "accounts": []
             }), 200
         except Exception as e:
@@ -95,12 +104,13 @@ def create_account():
                 user_msg.append("Possible invalid time zone. See: https://developers.google.com/google-ads/api/reference/data/codes-formats#timezone-ids")
             if "descriptive_name" in err_msg:
                 user_msg.append("Problem with the account name. Use 1-100 normal characters, no <, >, or /.")
+            if "email" in err_msg or "access_email" in err_msg:
+                user_msg.append("Problem with the provided client email address. Must be valid.")
             return jsonify({"success": False, "errors": user_msg + [err_msg], "accounts": []}), 400
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
 
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
-    """ Query: ?mcc_id=1234567890 """
     mcc_id = request.args.get('mcc_id', '').strip()
     if not mcc_id.isdigit():
         return jsonify({"success": False, "errors": ["Manager customer ID must be numeric."], "accounts": []}), 400
@@ -132,7 +142,7 @@ def index():
     return jsonify({
         "message": "Google Ads Backend API",
         "endpoints": {
-            "POST /create-account": "Create a new client account. Body: {name, currency, timezone, [tracking_url], [final_url_suffix]}",
+            "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
             "GET /list-linked-accounts?mcc_id=...": "List all client accounts under this MCC."
         }
     })
