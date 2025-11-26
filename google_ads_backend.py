@@ -141,15 +141,16 @@ def list_linked_accounts():
 def update_email():
     """
     Expects JSON: { "customer_id": "CLIENT_CUSTOMER_ID", "email": "new@email.com" }
+    Removes previous dashboard/invite email access, then invites the new one.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
-    email = str(data.get('email', '')).strip()
+    new_email = str(data.get('email', '')).strip()
 
     errors = []
     if not customer_id or not customer_id.isdigit():
         errors.append("Valid numeric Google Ads customer_id is required.")
-    if not email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+    if not new_email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", new_email):
         errors.append("Valid access email is required.")
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
@@ -157,23 +158,56 @@ def update_email():
     for attempt in range(3):
         try:
             client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+            user_access_service = client.get_service("CustomerUserAccessService")
+            ga_service = client.get_service("GoogleAdsService")
+
+            # 1. Find active user accesses (READ_ONLY) for the client account
+            query = """
+                SELECT
+                  customer_user_access.resource_name,
+                  customer_user_access.email_address,
+                  customer_user_access.access_role
+                FROM customer_user_access
+                WHERE customer_user_access.access_role = READ_ONLY
+            """
+            response = ga_service.search(customer_id=customer_id, query=query)
+            accesses_removed = []
+            op_list = []
+            for row in response:
+                if row.customer_user_access.email_address != new_email:
+                    access_resource = row.customer_user_access.resource_name
+                    op = client.get_type("CustomerUserAccessOperation")
+                    op.remove = access_resource
+                    op_list.append(op)
+                    accesses_removed.append(row.customer_user_access.email_address)
+
+            # Remove all other READ_ONLY user accesses (except new_email)
+            if op_list:
+                user_access_service.mutate_customer_user_accesses(
+                    customer_id=customer_id,
+                    operations=op_list
+                )
+
+            # 2. Send invitation to new email
             invitation_service = client.get_service("CustomerUserAccessInvitationService")
             invitation_operation = client.get_type("CustomerUserAccessInvitationOperation")
             invitation = invitation_operation.create
-            invitation.email_address = email
+            invitation.email_address = new_email
             invitation.access_role = "READ_ONLY"
-            # Send Invite
-            invitation_response = invitation_service.mutate_customer_user_access_invitation(
+            invitation_service.mutate_customer_user_access_invitation(
                 customer_id=customer_id,
                 operation=invitation_operation
             )
+
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
                 "invite_sent": True,
-                "invited_email": email,
+                "invited_email": new_email,
+                "access_removed": accesses_removed,
                 "role": "READ_ONLY"
             }), 200
+
         except Exception as e:
             if is_network_error(e):
                 if attempt < 2:
@@ -200,7 +234,7 @@ def index():
         "endpoints": {
             "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
             "GET /list-linked-accounts?mcc_id=...": "List all client accounts under this MCC.",
-            "POST /update-email": "Send a new READ_ONLY invite with updated email to an existing client account. Body: {customer_id, email}"
+            "POST /update-email": "Remove previous READ_ONLY email(s) and send a new invite with updated email. Body: {customer_id, email}"
         }
     })
 
