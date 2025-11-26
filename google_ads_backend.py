@@ -137,13 +137,70 @@ def list_linked_accounts():
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
+@app.route('/update-email', methods=['POST'])
+def update_email():
+    """
+    Expects JSON: { "customer_id": "CLIENT_CUSTOMER_ID", "email": "new@email.com" }
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+    email = str(data.get('email', '')).strip()
+
+    errors = []
+    if not customer_id or not customer_id.isdigit():
+        errors.append("Valid numeric Google Ads customer_id is required.")
+    if not email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        errors.append("Valid access email is required.")
+    if errors:
+        return jsonify({"success": False, "errors": errors}), 400
+
+    for attempt in range(3):
+        try:
+            client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+            invitation_service = client.get_service("CustomerUserAccessInvitationService")
+            invitation_operation = client.get_type("CustomerUserAccessInvitationOperation")
+            invitation = invitation_operation.create
+            invitation.email_address = email
+            invitation.access_role = "READ_ONLY"
+            # Send Invite
+            invitation_response = invitation_service.mutate_customer_user_access_invitation(
+                customer_id=customer_id,
+                operation=invitation_operation
+            )
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "invite_sent": True,
+                "invited_email": email,
+                "role": "READ_ONLY"
+            }), 200
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({
+                    "success": False, "errors": [
+                        "Network error (unable to reach Google servers). Please try again.", str(e)
+                    ]
+                }), 500
+            err_msg = str(e)
+            user_msg = []
+            if "email" in err_msg or "access_email" in err_msg:
+                user_msg.append("Problem with the provided client email address. Must be valid.")
+            if "customer_id" in err_msg:
+                user_msg.append("Problem with the provided client customer_id — must be the customer (not manager) account id.")
+            return jsonify({"success": False, "errors": user_msg + [err_msg]}), 400
+    return jsonify({"success": False, "errors": ["Max network retries reached."]}), 500
+
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         "message": "Google Ads Backend API",
         "endpoints": {
             "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
-            "GET /list-linked-accounts?mcc_id=...": "List all client accounts under this MCC."
+            "GET /list-linked-accounts?mcc_id=...": "List all client accounts under this MCC.",
+            "POST /update-email": "Send a new READ_ONLY invite with updated email to an existing client account. Body: {customer_id, email}"
         }
     })
 
