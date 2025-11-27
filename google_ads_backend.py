@@ -1,16 +1,34 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
 import time
 import socket
 import re
 import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
-MCC_CUSTOMER_ID = '1331285009'
+
+def load_google_ads_client():
+    """
+    Load Google Ads client and derive MCC (manager) customer ID from config.
+    Uses login_customer_id from google-ads.yaml.
+    """
+    client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+    # login_customer_id may be bytes or str depending on lib version
+    login_cid = client.login_customer_id
+    if login_cid is None:
+        raise ValueError(
+            "login_customer_id is not set in google-ads.yaml. "
+            "Set it to your manager (MCC) account ID without dashes."
+        )
+    # Normalize to string without dashes
+    mcc_id = str(login_cid).replace("-", "").strip()
+    return client, mcc_id
 
 def is_network_error(e):
     msg = str(e).lower()
@@ -49,7 +67,7 @@ def create_account():
 
     for attempt in range(3):
         try:
-            client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+            client, mcc_customer_id = load_google_ads_client()
             customer_service = client.get_service("CustomerService")
             customer = client.get_type("Customer")
             customer.descriptive_name = name
@@ -59,8 +77,9 @@ def create_account():
                 customer.tracking_url_template = tracking_url
             if final_url_suffix:
                 customer.final_url_suffix = final_url_suffix
+
             response = customer_service.create_customer_client(
-                customer_id=MCC_CUSTOMER_ID,
+                customer_id=mcc_customer_id,
                 customer_client=customer
             )
             customer_id = response.resource_name.split('/')[-1]
@@ -71,8 +90,7 @@ def create_account():
             invitation = invitation_operation.create
             invitation.email_address = email
             invitation.access_role = "READ_ONLY"
-            # Send Invite
-            invitation_response = invitation_service.mutate_customer_user_access_invitation(
+            invitation_service.mutate_customer_user_access_invitation(
                 customer_id=customer_id,
                 operation=invitation_operation
             )
@@ -111,11 +129,13 @@ def create_account():
 
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
-    mcc_id = request.args.get('mcc_id', '').strip()
-    if not mcc_id.isdigit():
-        return jsonify({"success": False, "errors": ["Manager customer ID must be numeric."], "accounts": []}), 400
+    # mcc_id comes from YAML (login_customer_id), not from query anymore
     try:
-        client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+        client, mcc_id = load_google_ads_client()
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
+
+    try:
         ga_service = client.get_service("GoogleAdsService")
         query = """
             SELECT
@@ -157,7 +177,7 @@ def update_email():
 
     for attempt in range(3):
         try:
-            client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
+            client, _ = load_google_ads_client()
             user_access_service = client.get_service("CustomerUserAccessService")
             ga_service = client.get_service("GoogleAdsService")
 
@@ -227,14 +247,201 @@ def update_email():
             return jsonify({"success": False, "errors": user_msg + [err_msg]}), 400
     return jsonify({"success": False, "errors": ["Max network retries reached."]}), 500
 
+@app.route('/approve-topup', methods=['POST'])
+def approve_topup():
+    """
+    POST /approve-topup
+
+    When admin approves a user's top-up/deposit request, this endpoint assigns
+    a spending limit to the Google Ads client account via Account Budget.
+
+    Expected JSON:
+    {
+        "customer_id": "1234567890",
+        "topup_amount": 100,
+        "currency": "USD"
+    }
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+    topup_amount = data.get('topup_amount')
+    currency = str(data.get('currency', '')).strip().upper()
+
+    # Step 1: validate input
+    errors = []
+    if not customer_id or not customer_id.isdigit():
+        errors.append("Valid numeric customer_id is required (client's Google Ads account ID).")
+    if topup_amount is None:
+        errors.append("topup_amount is required.")
+    else:
+        try:
+            topup_amount = float(topup_amount)
+            if topup_amount <= 0:
+                errors.append("topup_amount must be greater than 0.")
+        except (ValueError, TypeError):
+            errors.append("topup_amount must be a valid number.")
+    if not re.match(r"^[A-Z]{3}$", currency):
+        errors.append("Currency must be a 3-letter currency code (e.g., USD, PKR, EUR).")
+
+    if errors:
+        return jsonify({"success": False, "errors": errors}), 400
+
+    # Step 2: convert to micros
+    spending_limit_micros = int(topup_amount * 1_000_000)
+
+    for attempt in range(3):
+        try:
+            client, _ = load_google_ads_client()
+            ga_service = client.get_service("GoogleAdsService")
+            proposal_service = client.get_service("AccountBudgetProposalService")
+
+            # Step 3: check existing account_budget in client account
+            budget_query = """
+                SELECT
+                    account_budget.id,
+                    account_budget.resource_name,
+                    account_budget.status,
+                    account_budget.approved_spending_limit_micros,
+                    account_budget.proposed_spending_limit_micros,
+                    account_budget.billing_setup,
+                    account_budget.pending_proposal
+                FROM account_budget
+                ORDER BY account_budget.id
+            """
+            budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
+
+            existing_budget = None
+            for row in budget_response:
+                existing_budget = row.account_budget
+                break
+
+            # Step 4: build proposal operation
+            operation = client.get_type("AccountBudgetProposalOperation")
+            proposal = operation.create
+
+            enums = client.get_type("AccountBudgetProposalTypeEnum")
+            time_enums = client.get_type("TimeTypeEnum")
+
+            if existing_budget:
+                # UPDATE existing budget
+                proposal.proposal_type = enums.UPDATE
+                proposal.account_budget = existing_budget.resource_name
+                proposal.proposed_spending_limit_micros = spending_limit_micros
+                proposal.proposed_notes = (
+                    f"Updated via /approve-topup. New limit: {topup_amount} {currency}."
+                )
+                proposal_type_name = "UPDATE"
+            else:
+                # CREATE new budget (needs billing_setup from client)
+                billing_query = """
+                    SELECT
+                        billing_setup.id,
+                        billing_setup.resource_name,
+                        billing_setup.status
+                    FROM billing_setup
+                    ORDER BY billing_setup.id
+                """
+                billing_response = ga_service.search(customer_id=customer_id, query=billing_query)
+
+                billing_setup_resource = None
+                for row in billing_response:
+                    status_name = row.billing_setup.status.name
+                    if status_name in ("APPROVED", "ACTIVE"):
+                        billing_setup_resource = row.billing_setup.resource_name
+                        break
+
+                if not billing_setup_resource:
+                    return jsonify({
+                        "success": False,
+                        "errors": [
+                            "No active/approved billing setup found for this client. "
+                            "Client must be on monthly invoicing before assigning an account budget."
+                        ]
+                    }), 400
+
+                proposal.proposal_type = enums.CREATE
+                proposal.billing_setup = billing_setup_resource
+                proposal.proposed_spending_limit_micros = spending_limit_micros
+                proposal.proposed_name = f"Top-up budget: {topup_amount} {currency}"
+                proposal.proposed_notes = (
+                    f"Created via /approve-topup. Limit: {topup_amount} {currency}."
+                )
+                proposal.proposed_start_time_type = time_enums.NOW
+                proposal.proposed_end_time_type = time_enums.FOREVER
+                proposal_type_name = "CREATE"
+
+            # Step 5: send proposal
+            response = proposal_service.mutate_account_budget_proposal(
+                customer_id=customer_id,
+                operation=operation
+            )
+
+            resource_name = response.result.resource_name
+            proposal_id = resource_name.split("/")[-1]
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "topup_amount": topup_amount,
+                "currency": currency,
+                "spending_limit_micros": spending_limit_micros,
+                "proposal_type": proposal_type_name,
+                "proposal_id": proposal_id,
+                "status": "PENDING",
+                "account_budget_proposal_resource": resource_name,
+                "message": (
+                    f"Spending limit of {topup_amount} {currency} has been submitted to Google Ads "
+                    f"(proposal type: {proposal_type_name}). It will take effect once approved."
+                ),
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            err_msg = str(e)
+            user_msg = []
+            if "MUTATE_NOT_ALLOWED" in err_msg:
+                user_msg.append("Mutate not allowed. Ensure the client is on monthly invoicing and billing is configured.")
+            if "INVALID_ARGUMENT" in err_msg:
+                user_msg.append("Invalid customer_id or incompatible billing configuration.")
+            if "RESOURCE_NOT_FOUND" in err_msg:
+                user_msg.append("Required billing or budget resource not found for this client.")
+            if "PERMISSION_DENIED" in err_msg:
+                user_msg.append("Permission denied. Verify MCC has access to the client account.")
+            if not user_msg:
+                user_msg.append(f"Google Ads API error: {err_msg}")
+            return jsonify({"success": False, "errors": user_msg}), 400
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({
+                    "success": False,
+                    "errors": [
+                        "Network error (unable to reach Google servers). Please try again.",
+                        str(e)
+                    ]
+                }), 500
+            return jsonify({
+                "success": False,
+                "errors": [f"Unexpected error: {str(e)}"]
+            }), 500
+
+    return jsonify({
+        "success": False,
+        "errors": ["Max network retries reached. Please try again later."]
+    }), 500
+
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         "message": "Google Ads Backend API",
         "endpoints": {
             "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
-            "GET /list-linked-accounts?mcc_id=...": "List all client accounts under this MCC.",
-            "POST /update-email": "Remove previous READ_ONLY email(s) and send a new invite with updated email. Body: {customer_id, email}"
+            "GET /list-linked-accounts": "List all client accounts under the MCC from google-ads.yaml login_customer_id.",
+            "POST /update-email": "Remove previous READ_ONLY email(s) and send a new invite with updated email. Body: {customer_id, email}",
+            "POST /approve-topup": "When admin approves a user's top-up, assign/adjust account-level spending limit for that client. Body: {customer_id, topup_amount, currency}"
         }
     })
 
