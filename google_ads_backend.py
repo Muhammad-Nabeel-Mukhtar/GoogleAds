@@ -374,7 +374,7 @@ def approve_topup():
                         "success": False,
                         "errors": [
                             "No active/approved billing setup found for this client. "
-                            "Client must be on monthly invoicing before assigning an account budget."
+                            "Client must be on monthly invoicing (invoice billing) before assigning an account budget."
                         ]
                     }), 400
 
@@ -416,18 +416,40 @@ def approve_topup():
             }), 200
 
         except GoogleAdsException as e:
+            # TEMP: log full error details to your server logs for debugging
+            print("GoogleAdsException in /approve-topup")
+            print("Request ID:", e.request_id)
+            for error in e.failure.errors:
+                print("  Error code:", error.error_code)
+                print("  Message   :", error.message)
+
             err_msg = str(e)
             user_msg = []
+
+            # Map common root causes more clearly
             if "MUTATE_NOT_ALLOWED" in err_msg:
-                user_msg.append("Mutate not allowed. Ensure the client is on monthly invoicing and billing is configured.")
+                user_msg.append(
+                    "Mutate not allowed: this account cannot use account budgets via API. "
+                    "Usually means it is not on monthly invoicing."
+                )
+            if "ACCOUNT_BUDGET_PROPOSAL_ERROR" in err_msg or "ACCOUNT_BUDGET_ERROR" in err_msg:
+                user_msg.append(
+                    "Account budget operation rejected. Check that the client uses invoice billing and has a valid billing setup under your manager."
+                )
             if "INVALID_ARGUMENT" in err_msg:
-                user_msg.append("Invalid customer_id or incompatible billing configuration.")
+                user_msg.append(
+                    "Invalid argument: often caused by trying to set an account budget on a non‑invoicing (card) account or a test account."
+                )
             if "RESOURCE_NOT_FOUND" in err_msg:
-                user_msg.append("Required billing or budget resource not found for this client.")
+                user_msg.append(
+                    "Required billing or budget resource not found for this client. No usable BillingSetup may exist."
+                )
             if "PERMISSION_DENIED" in err_msg:
-                user_msg.append("Permission denied. Verify MCC has access to the client account.")
+                user_msg.append("Permission denied. Verify your MCC has access to this client account.")
+
             if not user_msg:
                 user_msg.append(f"Google Ads API error: {err_msg}")
+
             return jsonify({"success": False, "errors": user_msg}), 400
 
         except Exception as e:
@@ -451,6 +473,7 @@ def approve_topup():
         "success": False,
         "errors": ["Max network retries reached. Please try again later."]
     }), 500
+
 
 @app.route('/', methods=['GET'])
 def index():
