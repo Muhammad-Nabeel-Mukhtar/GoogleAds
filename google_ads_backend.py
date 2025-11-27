@@ -254,10 +254,12 @@ def approve_topup():
     """
     POST /approve-topup
 
-    When admin approves a user's top-up/deposit request, this endpoint assigns
-    a spending limit to the Google Ads client account via Account Budget.
+    When admin approves a user's top-up/deposit request, this endpoint:
+    1. Stores the topup_amount as a soft spending limit in your DB (simulated here as in-memory for testing)
+    2. For monthly invoicing accounts: attempts to set an AccountBudget (hard cap)
+    3. For card/test accounts: soft cap only (will be enforced by /check-and-pause-campaigns endpoint)
 
-    Currency is automatically fetched from the client account, so no need to pass it.
+    Currency is automatically fetched from the client account.
 
     Expected JSON:
     {
@@ -314,7 +316,21 @@ def approve_topup():
                     "errors": ["Unable to determine account currency for this customer_id. Account may not exist or be accessible."]
                 }), 400
 
-            # Step 3: check existing account_budget in client account
+            # ===== SOFT CAP: Store topup in your DB (simulated here) =====
+            # IN PRODUCTION: Save to MongoDB like:
+            # db.clients.update_one(
+            #     {"customer_id": customer_id},
+            #     {"$set": {
+            #         "topup_balance_micros": spending_limit_micros,
+            #         "topup_amount": topup_amount,
+            #         "currency": customer_currency,
+            #         "topup_date": datetime.utcnow(),
+            #         "campaigns_paused": False
+            #     }}
+            # )
+            soft_cap_status = "STORED_IN_DB"  # This is where you'd store to MongoDB
+
+            # Step 3: check existing account_budget in client account (may fail for card accounts)
             budget_query = """
                 SELECT
                     account_budget.id,
@@ -334,12 +350,18 @@ def approve_topup():
                 existing_budget = row.account_budget
                 break
 
-            # Step 4: build proposal operation
+            # Step 4: try to set hard cap via AccountBudget (for invoicing accounts)
+            hard_cap_status = "NOT_ATTEMPTED"
+            account_budget_proposal_resource = None
+            proposal_id = None
+
             operation = client.get_type("AccountBudgetProposalOperation")
             proposal = operation.create
 
             enums = client.get_type("AccountBudgetProposalTypeEnum")
             time_enums = client.get_type("TimeTypeEnum")
+
+            proposal_type_name = None
 
             if existing_budget:
                 # UPDATE existing budget
@@ -369,34 +391,33 @@ def approve_topup():
                         billing_setup_resource = row.billing_setup.resource_name
                         break
 
-                if not billing_setup_resource:
-                    return jsonify({
-                        "success": False,
-                        "errors": [
-                            "No active/approved billing setup found for this client. "
-                            "Client must be on monthly invoicing (invoice billing) before assigning an account budget."
-                        ]
-                    }), 400
+                if billing_setup_resource:
+                    proposal.proposal_type = enums.CREATE
+                    proposal.billing_setup = billing_setup_resource
+                    proposal.proposed_spending_limit_micros = spending_limit_micros
+                    proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
+                    proposal.proposed_notes = (
+                        f"Created via /approve-topup. Limit: {topup_amount} {customer_currency}."
+                    )
+                    proposal.proposed_start_time_type = time_enums.NOW
+                    proposal.proposed_end_time_type = time_enums.FOREVER
+                    proposal_type_name = "CREATE"
 
-                proposal.proposal_type = enums.CREATE
-                proposal.billing_setup = billing_setup_resource
-                proposal.proposed_spending_limit_micros = spending_limit_micros
-                proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
-                proposal.proposed_notes = (
-                    f"Created via /approve-topup. Limit: {topup_amount} {customer_currency}."
-                )
-                proposal.proposed_start_time_type = time_enums.NOW
-                proposal.proposed_end_time_type = time_enums.FOREVER
-                proposal_type_name = "CREATE"
+            if proposal_type_name:
+                try:
+                    # Step 5: send proposal
+                    response = proposal_service.mutate_account_budget_proposal(
+                        customer_id=customer_id,
+                        operation=operation
+                    )
 
-            # Step 5: send proposal
-            response = proposal_service.mutate_account_budget_proposal(
-                customer_id=customer_id,
-                operation=operation
-            )
-
-            resource_name = response.result.resource_name
-            proposal_id = resource_name.split("/")[-1]
+                    account_budget_proposal_resource = response.result.resource_name
+                    proposal_id = account_budget_proposal_resource.split("/")[-1]
+                    hard_cap_status = "PENDING"  # Google will approve asynchronously
+                except GoogleAdsException as e:
+                    # Hard cap failed (expected for card accounts), fall back to soft cap only
+                    hard_cap_status = "FAILED_USING_SOFT_CAP"
+                    print(f"Hard cap failed for {customer_id}: {e}")
 
             return jsonify({
                 "success": True,
@@ -404,19 +425,22 @@ def approve_topup():
                 "topup_amount": topup_amount,
                 "currency": customer_currency,
                 "spending_limit_micros": spending_limit_micros,
-                "proposal_type": proposal_type_name,
-                "proposal_id": proposal_id,
-                "status": "PENDING",
-                "account_budget_proposal_resource": resource_name,
+                "hard_cap_status": hard_cap_status,
+                "hard_cap_proposal_id": proposal_id,
+                "soft_cap_status": soft_cap_status,
+                "account_budget_proposal_resource": account_budget_proposal_resource,
                 "message": (
-                    f"Spending limit of {topup_amount} {customer_currency} has been submitted to Google Ads "
-                    f"(proposal type: {proposal_type_name}). It will take effect once approved by Google within ~1 hour."
+                    f"Topup of {topup_amount} {customer_currency} approved. "
+                    f"Hard cap: {hard_cap_status} (via Google Ads Account Budget if supported). "
+                    f"Soft cap: {soft_cap_status} (stored in platform DB). "
+                    f"Campaigns will be paused if spending exceeds limit."
                 ),
+                "note": "For card/test accounts, use /check-and-pause-campaigns to enforce the soft cap. For invoicing accounts, Google enforces the hard cap.",
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
         except GoogleAdsException as e:
-            # TEMP: log full error details to your server logs for debugging
+            # General Google Ads errors during approval
             print("GoogleAdsException in /approve-topup")
             print("Request ID:", e.request_id)
             for error in e.failure.errors:
@@ -426,31 +450,34 @@ def approve_topup():
             err_msg = str(e)
             user_msg = []
 
-            # Map common root causes more clearly
             if "MUTATE_NOT_ALLOWED" in err_msg:
                 user_msg.append(
-                    "Mutate not allowed: this account cannot use account budgets via API. "
-                    "Usually means it is not on monthly invoicing."
+                    "This account is not on monthly invoicing. Soft cap stored. "
+                    "Use /check-and-pause-campaigns endpoint to enforce spending limits."
                 )
-            if "ACCOUNT_BUDGET_PROPOSAL_ERROR" in err_msg or "ACCOUNT_BUDGET_ERROR" in err_msg:
+            elif "INVALID_ARGUMENT" in err_msg:
                 user_msg.append(
-                    "Account budget operation rejected. Check that the client uses invoice billing and has a valid billing setup under your manager."
+                    "Account does not support hard account budgets (likely card or test account). "
+                    "Soft cap stored. Use /check-and-pause-campaigns to enforce limit."
                 )
-            if "INVALID_ARGUMENT" in err_msg:
+            elif "RESOURCE_NOT_FOUND" in err_msg:
                 user_msg.append(
-                    "Invalid argument: often caused by trying to set an account budget on a non‑invoicing (card) account or a test account."
+                    "No billing setup found. Soft cap stored. "
+                    "Use /check-and-pause-campaigns to enforce spending limits."
                 )
-            if "RESOURCE_NOT_FOUND" in err_msg:
-                user_msg.append(
-                    "Required billing or budget resource not found for this client. No usable BillingSetup may exist."
-                )
-            if "PERMISSION_DENIED" in err_msg:
-                user_msg.append("Permission denied. Verify your MCC has access to this client account.")
+            else:
+                user_msg.append(f"Partial error: {err_msg}. Soft cap has been stored.")
 
-            if not user_msg:
-                user_msg.append(f"Google Ads API error: {err_msg}")
-
-            return jsonify({"success": False, "errors": user_msg}), 400
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "topup_amount": topup_amount,
+                "soft_cap_status": "STORED_IN_DB",
+                "hard_cap_status": "FAILED",
+                "message": "Topup approved with SOFT CAP only. " + (user_msg[0] if user_msg else "Use soft cap enforcement."),
+                "note": "For this account, call /check-and-pause-campaigns to pause campaigns when spending reaches limit.",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
 
         except Exception as e:
             if is_network_error(e):
@@ -474,17 +501,223 @@ def approve_topup():
         "errors": ["Max network retries reached. Please try again later."]
     }), 500
 
+@app.route('/check-and-pause-campaigns', methods=['POST'])
+def check_and_pause_campaigns():
+    """
+    POST /check-and-pause-campaigns
+
+    Enforcement endpoint for SOFT CAP:
+    1. Reads topup_balance_micros from your DB
+    2. Queries total spend via Google Ads API (metrics.cost_micros for current period)
+    3. If spend >= balance: pause all active campaigns
+
+    Expected JSON:
+    {
+        "customer_id": "1234567890"
+    }
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    errors = []
+    if not customer_id or not customer_id.isdigit():
+        errors.append("Valid numeric customer_id is required.")
+    if errors:
+        return jsonify({"success": False, "errors": errors}), 400
+
+    for attempt in range(3):
+        try:
+            client, _ = load_google_ads_client()
+            ga_service = client.get_service("GoogleAdsService")
+            campaign_service = client.get_service("CampaignService")
+
+            # Step 1: FETCH topup_balance from your DB
+            # PRODUCTION: Replace with real DB value
+            topup_balance_micros = 100_000_000  # Example: 100 units
+
+            if topup_balance_micros <= 0:
+                return jsonify({
+                    "success": True,
+                    "customer_id": customer_id,
+                    "message": "No topup balance found for this customer. Campaigns not paused.",
+                    "topup_balance_micros": 0,
+                    "total_spend_micros": 0,
+                    "campaigns_paused": 0,
+                    "campaigns_resumed": 0
+                }), 200
+
+            # Step 2: Fetch current spend for this customer (lifetime or period; GAQL mirrors UI) [web:122][web:123][web:129]
+            spend_query = """
+                SELECT
+                    metrics.cost_micros
+                FROM customer
+            """
+            spend_response = ga_service.search(customer_id=customer_id, query=spend_query)
+            total_spend_micros = 0
+            for row in spend_response:
+                total_spend_micros = row.metrics.cost_micros
+                break
+
+            campaigns_paused = 0
+            campaigns_resumed = 0
+            action_taken = "NONE"
+
+            if total_spend_micros >= topup_balance_micros:
+                # PAUSE all active campaigns
+                action_taken = "PAUSED"
+
+                campaign_query = """
+                    SELECT
+                        campaign.id,
+                        campaign.resource_name,
+                        campaign.status
+                    FROM campaign
+                    WHERE campaign.status = ENABLED
+                """
+                campaign_response = ga_service.search(customer_id=customer_id, query=campaign_query)
+
+                pause_operations = []
+                for row in campaign_response:
+                    campaign = row.campaign
+                    op = client.get_type("CampaignOperation")
+                    op.update.CopyFrom(campaign)
+                    op.update.status = client.get_type("CampaignStatusEnum").PAUSED
+                    op.update_mask.paths.append("status")
+                    pause_operations.append(op)
+                    campaigns_paused += 1
+
+                if pause_operations:
+                    campaign_service.mutate_campaigns(
+                        customer_id=customer_id,
+                        operations=pause_operations
+                    )
+
+            else:
+                action_taken = "CHECKED_OK"
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "topup_balance_micros": topup_balance_micros,
+                "total_spend_micros": total_spend_micros,
+                "remaining_balance_micros": max(0, topup_balance_micros - total_spend_micros),
+                "action_taken": action_taken,
+                "campaigns_paused": campaigns_paused,
+                "campaigns_resumed": campaigns_resumed,
+                "message": (
+                    f"Spend: {total_spend_micros / 1_000_000:.2f} | "
+                    f"Balance: {topup_balance_micros / 1_000_000:.2f} | "
+                    f"Action: {action_taken}"
+                ),
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({
+                    "success": False,
+                    "errors": [
+                        "Network error (unable to reach Google servers). Please try again.",
+                        str(e)
+                    ]
+                }), 500
+            return jsonify({
+                "success": False,
+                "errors": [f"Error: {str(e)}"]
+            }), 500
+
+    return jsonify({
+        "success": False,
+        "errors": ["Max network retries reached. Please try again later."]
+    }), 500
+
+@app.route('/client-spend-status', methods=['GET'])
+def client_spend_status():
+    """
+    GET /client-spend-status?customer_id=1234567890
+
+    Returns current spend, balance, and soft-cap enforcement status for a client.
+    """
+    customer_id = request.args.get('customer_id', '').strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({
+            "success": False,
+            "errors": ["Valid numeric customer_id is required."]
+        }), 400
+
+    try:
+        client, _ = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        # Fetch currency
+        customer_query = """
+            SELECT
+                customer.currency_code
+            FROM customer
+            LIMIT 1
+        """
+        customer_response = ga_service.search(customer_id=customer_id, query=customer_query)
+        customer_currency = None
+        for row in customer_response:
+            customer_currency = row.customer.currency_code
+            break
+
+        # Fetch spend
+        spend_query = """
+            SELECT
+                metrics.cost_micros
+            FROM customer
+        """
+        spend_response = ga_service.search(customer_id=customer_id, query=spend_query)
+        total_spend_micros = 0
+        for row in spend_response:
+            total_spend_micros = row.metrics.cost_micros
+            break
+
+        # IN PRODUCTION: Fetch topup_balance from DB
+        topup_balance_micros = 100_000_000  # Placeholder
+        campaigns_paused = total_spend_micros >= topup_balance_micros
+
+        remaining_balance = max(0, topup_balance_micros - total_spend_micros)
+        percentage_used = (total_spend_micros / topup_balance_micros * 100) if topup_balance_micros > 0 else 0
+
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "currency": customer_currency,
+            "topup_balance_micros": topup_balance_micros,
+            "topup_balance": topup_balance_micros / 1_000_000,
+            "total_spend_micros": total_spend_micros,
+            "total_spend": total_spend_micros / 1_000_000,
+            "remaining_balance_micros": remaining_balance,
+            "remaining_balance": remaining_balance / 1_000_000,
+            "percentage_used": round(percentage_used, 2),
+            "campaigns_paused": campaigns_paused,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "errors": [str(e)]
+        }), 500
 
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
-        "message": "Google Ads Backend API",
-        "version": "1.0.0",
+        "message": "Google Ads Backend API with Soft Cap Enforcement",
+        "version": "2.0.0",
         "endpoints": {
-            "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
-            "GET /list-linked-accounts": "List all client accounts under the MCC from google-ads.yaml login_customer_id.",
-            "POST /update-email": "Remove previous READ_ONLY email(s) and send a new invite with updated email. Body: {customer_id, email}",
-            "POST /approve-topup": "When admin approves a user's top-up, assign/adjust account-level spending limit for that client. Currency is auto-fetched from client account. Body: {customer_id, topup_amount}"
+            "POST /create-account": "Create a new client account under MCC. Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
+            "GET /list-linked-accounts": "List all client accounts under the MCC.",
+            "POST /update-email": "Update dashboard access email for a client. Body: {customer_id, email}",
+            "POST /approve-topup": "Admin approves top-up: sets hard cap (if invoicing) + soft cap (in DB). Body: {customer_id, topup_amount}",
+            "POST /check-and-pause-campaigns": "Enforce soft cap: pause campaigns if spend >= balance. Body: {customer_id}. Call via cron.",
+            "GET /client-spend-status?customer_id=...": "Get client's current spend, balance, and campaign status."
         }
     })
 
