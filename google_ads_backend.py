@@ -234,8 +234,10 @@ def update_email():
                     time.sleep(5)
                     continue
                 return jsonify({
-                    "success": False, "errors": [
-                        "Network error (unable to reach Google servers). Please try again.", str(e)
+                    "success": False,
+                    "errors": [
+                        "Network error (unable to reach Google servers). Please try again.",
+                        str(e)
                     ]
                 }), 500
             err_msg = str(e)
@@ -255,17 +257,17 @@ def approve_topup():
     When admin approves a user's top-up/deposit request, this endpoint assigns
     a spending limit to the Google Ads client account via Account Budget.
 
+    Currency is automatically fetched from the client account, so no need to pass it.
+
     Expected JSON:
     {
         "customer_id": "1234567890",
-        "topup_amount": 100,
-        "currency": "USD"
+        "topup_amount": 100
     }
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
     topup_amount = data.get('topup_amount')
-    currency = str(data.get('currency', '')).strip().upper()
 
     # Step 1: validate input
     errors = []
@@ -280,8 +282,6 @@ def approve_topup():
                 errors.append("topup_amount must be greater than 0.")
         except (ValueError, TypeError):
             errors.append("topup_amount must be a valid number.")
-    if not re.match(r"^[A-Z]{3}$", currency):
-        errors.append("Currency must be a 3-letter currency code (e.g., USD, PKR, EUR).")
 
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
@@ -294,6 +294,25 @@ def approve_topup():
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
             proposal_service = client.get_service("AccountBudgetProposalService")
+
+            # Step 2a: FETCH CLIENT CURRENCY from customer account
+            customer_query = """
+                SELECT
+                    customer.currency_code
+                FROM customer
+                LIMIT 1
+            """
+            customer_response = ga_service.search(customer_id=customer_id, query=customer_query)
+            customer_currency = None
+            for row in customer_response:
+                customer_currency = row.customer.currency_code
+                break
+
+            if not customer_currency:
+                return jsonify({
+                    "success": False,
+                    "errors": ["Unable to determine account currency for this customer_id. Account may not exist or be accessible."]
+                }), 400
 
             # Step 3: check existing account_budget in client account
             budget_query = """
@@ -328,7 +347,7 @@ def approve_topup():
                 proposal.account_budget = existing_budget.resource_name
                 proposal.proposed_spending_limit_micros = spending_limit_micros
                 proposal.proposed_notes = (
-                    f"Updated via /approve-topup. New limit: {topup_amount} {currency}."
+                    f"Updated via /approve-topup. New limit: {topup_amount} {customer_currency}."
                 )
                 proposal_type_name = "UPDATE"
             else:
@@ -362,9 +381,9 @@ def approve_topup():
                 proposal.proposal_type = enums.CREATE
                 proposal.billing_setup = billing_setup_resource
                 proposal.proposed_spending_limit_micros = spending_limit_micros
-                proposal.proposed_name = f"Top-up budget: {topup_amount} {currency}"
+                proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
                 proposal.proposed_notes = (
-                    f"Created via /approve-topup. Limit: {topup_amount} {currency}."
+                    f"Created via /approve-topup. Limit: {topup_amount} {customer_currency}."
                 )
                 proposal.proposed_start_time_type = time_enums.NOW
                 proposal.proposed_end_time_type = time_enums.FOREVER
@@ -383,15 +402,15 @@ def approve_topup():
                 "success": True,
                 "customer_id": customer_id,
                 "topup_amount": topup_amount,
-                "currency": currency,
+                "currency": customer_currency,
                 "spending_limit_micros": spending_limit_micros,
                 "proposal_type": proposal_type_name,
                 "proposal_id": proposal_id,
                 "status": "PENDING",
                 "account_budget_proposal_resource": resource_name,
                 "message": (
-                    f"Spending limit of {topup_amount} {currency} has been submitted to Google Ads "
-                    f"(proposal type: {proposal_type_name}). It will take effect once approved."
+                    f"Spending limit of {topup_amount} {customer_currency} has been submitted to Google Ads "
+                    f"(proposal type: {proposal_type_name}). It will take effect once approved by Google within ~1 hour."
                 ),
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
@@ -437,11 +456,12 @@ def approve_topup():
 def index():
     return jsonify({
         "message": "Google Ads Backend API",
+        "version": "1.0.0",
         "endpoints": {
             "POST /create-account": "Create a new client account and send dashboard invite (READ_ONLY only). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
             "GET /list-linked-accounts": "List all client accounts under the MCC from google-ads.yaml login_customer_id.",
             "POST /update-email": "Remove previous READ_ONLY email(s) and send a new invite with updated email. Body: {customer_id, email}",
-            "POST /approve-topup": "When admin approves a user's top-up, assign/adjust account-level spending limit for that client. Body: {customer_id, topup_amount, currency}"
+            "POST /approve-topup": "When admin approves a user's top-up, assign/adjust account-level spending limit for that client. Currency is auto-fetched from client account. Body: {customer_id, topup_amount}"
         }
     })
 
