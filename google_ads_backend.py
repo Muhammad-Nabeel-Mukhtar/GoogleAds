@@ -45,6 +45,22 @@ def is_network_error(e):
 
 @app.route('/create-account', methods=['POST'])
 def create_account():
+    """
+    POST /create-account
+    
+    Creates a new client account under MCC and optionally auto-assigns billing setup.
+    
+    Expected JSON:
+    {
+        "name": "Account Name",
+        "currency": "USD",
+        "timezone": "Asia/Karachi",
+        "email": "client@example.com",
+        "tracking_url": "optional",
+        "final_url_suffix": "optional",
+        "auto_assign_billing": true  # NEW: auto-assign billing setup from MCC
+    }
+    """
     data = request.json or {}
     name = data.get('name', '').strip()
     currency = data.get('currency', '').strip().upper()
@@ -52,6 +68,7 @@ def create_account():
     tracking_url = data.get('tracking_url')
     final_url_suffix = data.get('final_url_suffix')
     email = data.get('email', '').strip()
+    auto_assign_billing = data.get('auto_assign_billing', False)  # NEW
 
     errors = []
     if not (1 <= len(name) <= 100 and all(c.isprintable() and c not in "<>/" for c in name)):
@@ -95,6 +112,51 @@ def create_account():
                 operation=invitation_operation
             )
 
+            # NEW: Auto-assign billing setup if requested
+            billing_setup_assigned = False
+            if auto_assign_billing:
+                try:
+                    ga_service = client.get_service("GoogleAdsService")
+                    billing_service = client.get_service("BillingSetupService")
+                    
+                    # Step 1: Find APPROVED/ACTIVE billing setup on MCC
+                    billing_query = """
+                        SELECT
+                            billing_setup.id,
+                            billing_setup.resource_name,
+                            billing_setup.status,
+                            billing_setup.payments_profile
+                        FROM billing_setup
+                        WHERE billing_setup.status = APPROVED
+                        ORDER BY billing_setup.id
+                        LIMIT 1
+                    """
+                    billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+                    
+                    mcc_billing_setup = None
+                    for row in billing_response:
+                        mcc_billing_setup = row.billing_setup
+                        break
+                    
+                    if mcc_billing_setup:
+                        # Step 2: Create billing setup proposal for the new client
+                        bs_operation = client.get_type("BillingSetupOperation")
+                        bs_proposal = bs_operation.create
+                        bs_proposal.billing_setup = mcc_billing_setup.resource_name
+                        
+                        # Send the billing setup proposal to link to new client
+                        bs_response = billing_service.mutate_billing_setup(
+                            customer_id=customer_id,
+                            operation=bs_operation
+                        )
+                        billing_setup_assigned = True
+                        print(f"[DEBUG] Billing setup auto-assigned to {customer_id}")
+                    else:
+                        print(f"[DEBUG] No APPROVED billing setup found on MCC {mcc_customer_id}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to auto-assign billing: {str(e)}")
+                    # Continue anyway; billing can be assigned manually later
+
             return jsonify({
                 "success": True,
                 "resource_name": response.resource_name,
@@ -102,6 +164,8 @@ def create_account():
                 "invite_sent": True,
                 "invited_email": email,
                 "role": "READ_ONLY",
+                "auto_assign_billing": auto_assign_billing,
+                "billing_setup_assigned": billing_setup_assigned,
                 "accounts": []
             }), 200
         except Exception as e:
@@ -126,6 +190,153 @@ def create_account():
                 user_msg.append("Problem with the provided client email address. Must be valid.")
             return jsonify({"success": False, "errors": user_msg + [err_msg], "accounts": []}), 400
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
+
+
+@app.route('/assign-billing-setup', methods=['POST'])
+def assign_billing_setup():
+    """
+    POST /assign-billing-setup
+    
+    Assigns MCC's billing setup to an existing client account.
+    Useful for accounts created without auto_assign_billing or for manual assignment.
+    
+    Expected JSON:
+    {
+        "customer_id": "1234567890"
+    }
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({
+            "success": False,
+            "errors": ["Valid numeric customer_id is required."]
+        }), 400
+
+    for attempt in range(3):
+        try:
+            client, mcc_customer_id = load_google_ads_client()
+            ga_service = client.get_service("GoogleAdsService")
+            billing_service = client.get_service("BillingSetupService")
+
+            # Step 1: Find APPROVED/ACTIVE billing setup on MCC
+            billing_query = """
+                SELECT
+                    billing_setup.id,
+                    billing_setup.resource_name,
+                    billing_setup.status,
+                    billing_setup.payments_profile
+                FROM billing_setup
+                WHERE billing_setup.status = APPROVED
+                ORDER BY billing_setup.id
+                LIMIT 1
+            """
+            billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+
+            mcc_billing_setup = None
+            for row in billing_response:
+                mcc_billing_setup = row.billing_setup
+                print(f"[DEBUG] Found MCC billing setup: {mcc_billing_setup.resource_name}, status={mcc_billing_setup.status.name}")
+                break
+
+            if not mcc_billing_setup:
+                return jsonify({
+                    "success": False,
+                    "errors": ["No APPROVED billing setup found on MCC. Cannot assign billing."]
+                }), 400
+
+            # Step 2: Check if customer already has billing setup
+            customer_billing_query = """
+                SELECT
+                    billing_setup.id,
+                    billing_setup.resource_name,
+                    billing_setup.status
+                FROM billing_setup
+            """
+            customer_billing_response = ga_service.search(customer_id=customer_id, query=customer_billing_query)
+            
+            existing_billing = None
+            for row in customer_billing_response:
+                existing_billing = row.billing_setup
+                break
+
+            if existing_billing:
+                return jsonify({
+                    "success": False,
+                    "errors": [f"Customer already has a billing setup: {existing_billing.resource_name}. Cannot assign another."]
+                }), 400
+
+            # Step 3: Create billing setup proposal for the customer
+            bs_operation = client.get_type("BillingSetupOperation")
+            bs_proposal = bs_operation.create
+            bs_proposal.billing_setup = mcc_billing_setup.resource_name
+
+            bs_response = billing_service.mutate_billing_setup(
+                customer_id=customer_id,
+                operation=bs_operation
+            )
+
+            billing_setup_resource = bs_response.result.resource_name
+            print(f"[DEBUG] Billing setup assigned to {customer_id}: {billing_setup_resource}")
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "billing_setup_resource": billing_setup_resource,
+                "mcc_billing_setup": mcc_billing_setup.resource_name,
+                "message": f"Billing setup successfully assigned to customer {customer_id}. Will be PENDING until Google approves.",
+                "note": "Once approved (~1 hour), hard account budgets can be set for this account.",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            print("===== GoogleAdsException in /assign-billing-setup =====")
+            print("Customer ID:", customer_id)
+            print("Request ID:", e.request_id)
+            for error in e.failure.errors:
+                print("  Error code:", error.error_code)
+                print("  Message   :", error.message)
+            print("========================================================")
+
+            err_msg = str(e)
+            user_msg = []
+
+            if "BILLING_SETUP_NOT_PERMITTED_FOR_ACCOUNT_TYPE" in err_msg:
+                user_msg.append("This account type does not support billing setups (likely test account).")
+            elif "BILLING_SETUP_ALREADY_EXISTS" in err_msg:
+                user_msg.append("Customer already has a billing setup assigned.")
+            elif "INVALID_ARGUMENT" in err_msg:
+                user_msg.append("Invalid billing setup resource provided.")
+            else:
+                user_msg.append(f"Error: {err_msg}")
+
+            return jsonify({
+                "success": False,
+                "errors": user_msg
+            }), 400
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({
+                    "success": False,
+                    "errors": [
+                        "Network error (unable to reach Google servers). Please try again.",
+                        str(e)
+                    ]
+                }), 500
+            return jsonify({
+                "success": False,
+                "errors": [f"Unexpected error: {str(e)}"]
+            }), 500
+
+    return jsonify({
+        "success": False,
+        "errors": ["Max network retries reached. Please try again later."]
+    }), 500
 
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
