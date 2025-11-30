@@ -328,7 +328,6 @@ def approve_topup():
                     account_budget.approved_spending_limit_micros,
                     account_budget.proposed_spending_limit_micros,
                     account_budget.billing_setup,
-                    account_budget.pending_proposal
                 FROM account_budget
                 ORDER BY account_budget.id
             """
