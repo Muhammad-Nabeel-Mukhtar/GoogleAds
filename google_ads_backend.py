@@ -331,12 +331,19 @@ def approve_topup():
                 FROM account_budget
                 ORDER BY account_budget.id
             """
-            budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
-
-            existing_budget = None
-            for row in budget_response:
-                existing_budget = row.account_budget
-                break
+            try:
+                budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
+                existing_budget = None
+                for row in budget_response:
+                    existing_budget = row.account_budget
+                    print(f"[DEBUG] Found EXISTING account_budget: id={existing_budget.id}, status={existing_budget.status.name}")
+                    break
+                
+                if existing_budget is None:
+                    print(f"[DEBUG] No existing account_budget found for {customer_id}. Will CREATE new one.")
+            except Exception as e:
+                print(f"[DEBUG] Error querying account_budget: {str(e)}")
+                existing_budget = None
 
             # Step 4: try to set hard cap via AccountBudget (for invoicing accounts)
             hard_cap_status = "NOT_ATTEMPTED"
@@ -353,14 +360,18 @@ def approve_topup():
             proposal_type_name = None
 
             if existing_budget:
-                # UPDATE existing budget
+                # UPDATE existing budget - MUST include update_mask
                 proposal.proposal_type = proposal_type_enum.UPDATE
                 proposal.account_budget = existing_budget.resource_name
                 proposal.proposed_spending_limit_micros = spending_limit_micros
                 proposal.proposed_notes = (
                     f"Updated via /approve-topup. New limit: {topup_amount} {customer_currency}."
                 )
+                # FIX: Add update_mask to specify which fields are being changed
+                operation.update_mask.paths.append("proposed_spending_limit_micros")
+                operation.update_mask.paths.append("proposed_notes")
                 proposal_type_name = "UPDATE"
+                print(f"[DEBUG] Building UPDATE proposal for existing budget: {existing_budget.resource_name}")
             else:
                 # CREATE new budget (needs billing_setup from client)
                 billing_query = """
@@ -393,12 +404,14 @@ def approve_topup():
                     proposal.proposed_start_time_type = time_type_enum.NOW
                     proposal.proposed_end_time_type = time_type_enum.FOREVER
                     proposal_type_name = "CREATE"
+                    print(f"[DEBUG] Building CREATE proposal with billing_setup: {billing_setup_resource}")
                 else:
                     print(f"[DEBUG] No APPROVED/ACTIVE billing setup found for {customer_id} in API query")
 
             if proposal_type_name:
                 try:
                     # Step 5: send proposal
+                    print(f"[DEBUG] Sending {proposal_type_name} proposal to Google Ads API...")
                     response = proposal_service.mutate_account_budget_proposal(
                         customer_id=customer_id,
                         operation=operation
@@ -407,11 +420,13 @@ def approve_topup():
                     account_budget_proposal_resource = response.result.resource_name
                     proposal_id = account_budget_proposal_resource.split("/")[-1]
                     hard_cap_status = "PENDING"  # Google will approve asynchronously
+                    print(f"[DEBUG] SUCCESS: {proposal_type_name} proposal created. Resource: {account_budget_proposal_resource}")
                 except GoogleAdsException as e:
                     # Hard cap failed (card accounts / permission / config issues)
                     hard_cap_status = "FAILED_USING_SOFT_CAP"
                     print("===== Hard cap failed in inner mutate_account_budget_proposal =====")
                     print("Customer ID:", customer_id)
+                    print("Proposal Type:", proposal_type_name)
                     print("Request ID:", e.request_id)
                     for error in e.failure.errors:
                         print("  Error code:", error.error_code)
@@ -501,6 +516,7 @@ def approve_topup():
         "success": False,
         "errors": ["Max network retries reached. Please try again later."]
     }), 500
+
 
 
 @app.route('/check-and-pause-campaigns', methods=['POST'])
