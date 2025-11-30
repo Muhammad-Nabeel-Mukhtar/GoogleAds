@@ -242,8 +242,7 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Automatically assigns MCC's billing setup to an existing client account.
-    Billing setup ID loaded from environment variable BILLING_SETUP_ID.
+    Automatically assigns MCC's billing setup to an existing client account using AccountLinkService.
     
     Expected JSON:
     {
@@ -259,87 +258,107 @@ def assign_billing_setup():
             "errors": ["Valid numeric customer_id is required."]
         }), 400
 
-    if not BILLING_SETUP_IDS:
-        return jsonify({
-            "success": False,
-            "errors": ["No billing setup IDs configured in environment. Add BILLING_SETUP_ID to Render env vars."]
-        }), 500
-
     for attempt in range(3):
         try:
             client, mcc_customer_id = load_google_ads_client()
-            billing_service = client.get_service("BillingSetupService")
+            ga_service = client.get_service("GoogleAdsService")
+            account_link_service = client.get_service("AccountLinkService")
 
-            # Try each billing setup ID until one succeeds
-            for billing_setup_id in BILLING_SETUP_IDS:
-                try:
-                    # Build resource name for the MCC's billing setup
-                    mcc_billing_setup_resource = f"customers/{mcc_customer_id}/billingSetups/{billing_setup_id}"
-                    print(f"[DEBUG] Attempting to assign billing setup {billing_setup_id} to customer {customer_id}")
-                    print(f"[DEBUG] Using resource: {mcc_billing_setup_resource}")
+            # Step 1: Get existing billing setup from MCC
+            billing_query = """
+                SELECT
+                    billing_setup.id,
+                    billing_setup.resource_name,
+                    billing_setup.status
+                FROM billing_setup
+                ORDER BY billing_setup.id
+            """
+            
+            print(f"[DEBUG] Querying MCC {mcc_customer_id} for billing setups...")
+            billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
 
-                    # Create billing setup operation - MUST use exact field names for v22
-                    bs_operation = client.get_type("BillingSetupOperation")
-                    bs_create = bs_operation.create
-                    
-                    # Set the billing setup resource - this links the MCC's billing to the client
-                    bs_create.status = client.enums.BillingSetupStatusEnum.PENDING
-                    
-                    print(f"[DEBUG] Creating billing setup link...")
+            mcc_billing_setup_resource = None
+            for row in billing_response:
+                status_name = row.billing_setup.status.name
+                print(f"[DEBUG] Found billing setup: {row.billing_setup.id}, status={status_name}")
+                # Use first ACTIVE/APPROVED one
+                if status_name in ("ACTIVE", "APPROVED"):
+                    mcc_billing_setup_resource = row.billing_setup.resource_name
+                    print(f"[DEBUG] Selected billing setup: {mcc_billing_setup_resource}")
+                    break
 
-                    # Send mutation
-                    bs_response = billing_service.mutate_billing_setup(
-                        customer_id=customer_id,
-                        operation=bs_operation
-                    )
+            if not mcc_billing_setup_resource:
+                print(f"[DEBUG] No ACTIVE/APPROVED billing setup found on MCC")
+                return jsonify({
+                    "success": False,
+                    "errors": ["No ACTIVE billing setup found on MCC. Please check MCC billing settings."]
+                }), 400
 
-                    if bs_response.result.resource_name:
-                        billing_setup_resource = bs_response.result.resource_name
-                        print(f"[DEBUG] SUCCESS: Billing setup assigned to {customer_id}: {billing_setup_resource}")
+            # Step 2: Create account link to connect MCC's billing to client account
+            account_link_operation = client.get_type("AccountLinkOperation")
+            account_link = account_link_operation.create
+            
+            # Set the account link type and billing setup
+            account_link.type_ = client.enums.AccountLinkTypeEnum.MANAGER_LINK
+            account_link.manager_customer_id = mcc_customer_id
+            
+            print(f"[DEBUG] Creating account link from MCC {mcc_customer_id} to client {customer_id}...")
 
-                        return jsonify({
-                            "success": True,
-                            "customer_id": customer_id,
-                            "billing_setup_resource": billing_setup_resource,
-                            "billing_setup_id": billing_setup_id,
-                            "mcc_customer_id": mcc_customer_id,
-                            "message": f"Billing setup successfully linked to customer {customer_id}.",
-                            "note": "Will be PENDING until Google approves (~1 hour). Then hard account budgets can be set.",
-                            "timestamp": datetime.utcnow().isoformat() + "Z"
-                        }), 200
+            # Send the account link operation
+            al_response = account_link_service.mutate_account_link(
+                customer_id=customer_id,
+                operation=account_link_operation
+            )
 
-                except GoogleAdsException as e:
-                    error_msg = str(e)
-                    error_code = None
-                    if e.failure and e.failure.errors:
-                        error_code = e.failure.errors[0].error_code
-                    
-                    print(f"[DEBUG] Billing setup {billing_setup_id} failed: {error_code} - {error_msg}")
-                    
-                    if "BILLING_SETUP_ALREADY_EXISTS" in error_msg or error_code == 76:
-                        return jsonify({
-                            "success": False,
-                            "errors": ["Customer already has a billing setup assigned. Cannot assign another."]
-                        }), 400
-                    
-                    # Try next billing setup ID
-                    continue
+            account_link_resource = al_response.result.resource_name
+            print(f"[DEBUG] SUCCESS: Account linked. Resource: {account_link_resource}")
 
-            # If we get here, none of the billing setup IDs worked
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "mcc_customer_id": mcc_customer_id,
+                "billing_setup_resource": mcc_billing_setup_resource,
+                "account_link_resource": account_link_resource,
+                "message": f"Client account {customer_id} successfully linked to MCC {mcc_customer_id}. Billing will be inherited.",
+                "note": "Billing setup is now shared. You can create account budgets for this client.",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            print("===== GoogleAdsException in /assign-billing-setup =====")
+            print("Customer ID:", customer_id)
+            print("Request ID:", e.request_id)
+            for error in e.failure.errors:
+                print("  Error code:", error.error_code)
+                print("  Message   :", error.message)
+            print("========================================================")
+
+            err_msg = str(e)
+            user_msg = []
+
+            if "ACCOUNT_LINK_TYPE_NOT_ALLOWED" in err_msg:
+                user_msg.append("This account type does not support manager links.")
+            elif "ACCOUNT_ALREADY_LINKED" in err_msg:
+                user_msg.append("This client account is already linked to an MCC.")
+            elif "INVALID_ACCOUNT_LINK_CONFIGURATION" in err_msg:
+                user_msg.append("Invalid account link configuration. Check account status.")
+            else:
+                user_msg.append(f"Error: {err_msg}")
+
             return jsonify({
                 "success": False,
-                "errors": ["All configured billing setups failed. Check environment BILLING_SETUP_ID value."]
+                "errors": user_msg
             }), 400
 
         except Exception as e:
-            print(f"[DEBUG] Unexpected error in assign_billing_setup: {str(e)}")
+            print(f"[DEBUG] Unexpected error: {str(e)}")
             if is_network_error(e):
                 if attempt < 2:
                     time.sleep(5)
                     continue
                 return jsonify({
                     "success": False,
-                    "errors": ["Network error (unable to reach Google servers). Please try again.", str(e)]
+                    "errors": ["Network error. Please try again.", str(e)]
                 }), 500
             return jsonify({
                 "success": False,
