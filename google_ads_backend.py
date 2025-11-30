@@ -184,6 +184,80 @@ def list_linked_accounts():
             return jsonify({"success": False, "errors": [str(e)]}), 400
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
+
+@app.route('/debug-billing-setup', methods=['GET'])
+def debug_billing_setup():
+    """
+    GET /debug-billing-setup
+    
+    Debug endpoint to show:
+    1. Account customer ID from config
+    2. All billing setups on this account with their IDs and status
+    3. What to use for BILLING_SETUP_ID environment variable
+    """
+    try:
+        client, mcc_customer_id = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+        
+        print(f"[DEBUG-BS] Account Customer ID: {mcc_customer_id}")
+        
+        # Query all billing setups
+        billing_query = """
+            SELECT
+                billing_setup.id,
+                billing_setup.resource_name,
+                billing_setup.status
+            FROM billing_setup
+        """
+        
+        try:
+            response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+            
+            setups = []
+            for row in response:
+                bs = row.billing_setup
+                setups.append({
+                    "billing_setup_id": bs.id,
+                    "resource_name": bs.resource_name,
+                    "status": bs.status.name
+                })
+                print(f"[DEBUG-BS] Found: ID={bs.id}, Status={bs.status.name}, Resource={bs.resource_name}")
+            
+            if not setups:
+                print(f"[DEBUG-BS] No billing setups found on account {mcc_customer_id}")
+            
+            return jsonify({
+                "success": True,
+                "customer_id": mcc_customer_id,
+                "billing_setups_count": len(setups),
+                "billing_setups": setups,
+                "instruction": "Use one of the billing_setup_id values above as BILLING_SETUP_ID in Render environment variables",
+                "note": "Prefer billing setups with status = ACTIVE"
+            }), 200
+            
+        except GoogleAdsException as e:
+            print(f"[DEBUG-BS] GoogleAdsException: {str(e)}")
+            for error in e.failure.errors:
+                print(f"[DEBUG-BS] Error: {error.error_code.name} - {error.message}")
+            
+            return jsonify({
+                "success": False,
+                "customer_id": mcc_customer_id,
+                "error": str(e),
+                "error_details": [{"code": err.error_code.name, "message": err.message} for err in e.failure.errors]
+            }), 400
+            
+    except Exception as e:
+        print(f"[DEBUG-BS] Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
