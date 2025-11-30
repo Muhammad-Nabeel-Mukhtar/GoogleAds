@@ -148,6 +148,33 @@ def create_account():
             return jsonify({"success": False, "errors": user_msg + [err_msg], "accounts": []}), 400
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
 
+
+# Add this debug endpoint temporarily
+@app.route('/debug-mcc', methods=['GET'])
+def debug_mcc():
+    try:
+        client, mcc_customer_id = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+        
+        billing_query = "SELECT billing_setup.id, billing_setup.resource_name, billing_setup.status FROM billing_setup"
+        response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+        
+        setups = []
+        for row in response:
+            setups.append({
+                "id": row.billing_setup.id,
+                "resource": row.billing_setup.resource_name,
+                "status": row.billing_setup.status.name
+            })
+        
+        return jsonify({
+            "mcc_customer_id": mcc_customer_id,
+            "billing_setups": setups
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
     """GET /list-linked-accounts - List all client accounts under MCC."""
