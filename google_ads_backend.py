@@ -214,29 +214,38 @@ def assign_billing_setup():
             ga_service = client.get_service("GoogleAdsService")
             billing_service = client.get_service("BillingSetupService")
 
-            # Step 1: Find APPROVED/ACTIVE billing setup on MCC (FIXED QUERY - removed payments_profile)
+            # Step 1: Find ANY billing setup on MCC (no WHERE clause - get all)
             billing_query = """
                 SELECT
                     billing_setup.id,
                     billing_setup.resource_name,
                     billing_setup.status
                 FROM billing_setup
-                WHERE billing_setup.status = APPROVED
                 ORDER BY billing_setup.id
-                LIMIT 1
             """
             billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
 
             mcc_billing_setup = None
             for row in billing_response:
-                mcc_billing_setup = row.billing_setup
-                print(f"[DEBUG] Found MCC billing setup: {mcc_billing_setup.resource_name}, status={mcc_billing_setup.status.name}")
-                break
+                status_name = row.billing_setup.status.name
+                print(f"[DEBUG] Found billing setup: {row.billing_setup.resource_name}, status={status_name}")
+                # Accept APPROVED or ACTIVE status
+                if status_name in ("APPROVED", "ACTIVE"):
+                    mcc_billing_setup = row.billing_setup
+                    break
+
+            if not mcc_billing_setup:
+                # If no APPROVED/ACTIVE, just use the first one found
+                billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+                for row in billing_response:
+                    mcc_billing_setup = row.billing_setup
+                    print(f"[DEBUG] Using first available billing setup (status may be different): {mcc_billing_setup.resource_name}")
+                    break
 
             if not mcc_billing_setup:
                 return jsonify({
                     "success": False,
-                    "errors": ["No APPROVED billing setup found on MCC. Cannot assign billing."]
+                    "errors": ["No billing setup found on MCC. Cannot assign billing."]
                 }), 400
 
             # Step 2: Check if customer already has billing setup
@@ -247,23 +256,28 @@ def assign_billing_setup():
                     billing_setup.status
                 FROM billing_setup
             """
-            customer_billing_response = ga_service.search(customer_id=customer_id, query=customer_billing_query)
-            
-            existing_billing = None
-            for row in customer_billing_response:
-                existing_billing = row.billing_setup
-                break
+            try:
+                customer_billing_response = ga_service.search(customer_id=customer_id, query=customer_billing_query)
+                
+                existing_billing = None
+                for row in customer_billing_response:
+                    existing_billing = row.billing_setup
+                    break
 
-            if existing_billing:
-                return jsonify({
-                    "success": False,
-                    "errors": [f"Customer already has a billing setup: {existing_billing.resource_name}. Cannot assign another."]
-                }), 400
+                if existing_billing:
+                    return jsonify({
+                        "success": False,
+                        "errors": [f"Customer already has a billing setup: {existing_billing.resource_name}. Cannot assign another."]
+                    }), 400
+            except Exception as e:
+                print(f"[DEBUG] No existing billing setup on customer (expected for new accounts): {str(e)}")
 
             # Step 3: Create billing setup proposal for the customer
             bs_operation = client.get_type("BillingSetupOperation")
             bs_proposal = bs_operation.create
             bs_proposal.billing_setup = mcc_billing_setup.resource_name
+            
+            print(f"[DEBUG] Attempting to assign billing setup {mcc_billing_setup.resource_name} to customer {customer_id}")
 
             bs_response = billing_service.mutate_billing_setup(
                 customer_id=customer_id,
