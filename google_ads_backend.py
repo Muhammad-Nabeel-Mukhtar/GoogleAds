@@ -198,12 +198,6 @@ def assign_billing_setup():
     POST /assign-billing-setup
     
     Assigns MCC's billing setup to an existing client account.
-    Useful for accounts created without auto_assign_billing or for manual assignment.
-    
-    Expected JSON:
-    {
-        "customer_id": "1234567890"
-    }
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -220,13 +214,12 @@ def assign_billing_setup():
             ga_service = client.get_service("GoogleAdsService")
             billing_service = client.get_service("BillingSetupService")
 
-            # Step 1: Find APPROVED/ACTIVE billing setup on MCC
+            # Step 1: Find APPROVED/ACTIVE billing setup on MCC (FIXED QUERY - removed payments_profile)
             billing_query = """
                 SELECT
                     billing_setup.id,
                     billing_setup.resource_name,
-                    billing_setup.status,
-                    billing_setup.payments_profile
+                    billing_setup.status
                 FROM billing_setup
                 WHERE billing_setup.status = APPROVED
                 ORDER BY billing_setup.id
