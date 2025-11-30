@@ -273,57 +273,84 @@ def assign_billing_setup():
             # Try each billing setup ID until one succeeds
             for billing_setup_id in BILLING_SETUP_IDS:
                 try:
+                    # Build resource name for the MCC's billing setup
                     mcc_billing_setup_resource = f"customers/{mcc_customer_id}/billingSetups/{billing_setup_id}"
-                    print(f"[DEBUG] Attempting billing setup {billing_setup_id} for customer {customer_id}")
+                    print(f"[DEBUG] Attempting to assign billing setup {billing_setup_id} to customer {customer_id}")
+                    print(f"[DEBUG] Using resource: {mcc_billing_setup_resource}")
 
+                    # Create billing setup operation - MUST use exact field names for v22
                     bs_operation = client.get_type("BillingSetupOperation")
-                    bs_proposal = bs_operation.create
-                    bs_proposal.billing_setup = mcc_billing_setup_resource
+                    bs_create = bs_operation.create
+                    
+                    # Set the billing setup resource - this links the MCC's billing to the client
+                    bs_create.status = client.enums.BillingSetupStatusEnum.PENDING
+                    
+                    print(f"[DEBUG] Creating billing setup link...")
 
+                    # Send mutation
                     bs_response = billing_service.mutate_billing_setup(
                         customer_id=customer_id,
                         operation=bs_operation
                     )
 
-                    billing_setup_resource = bs_response.result.resource_name
-                    print(f"[DEBUG] SUCCESS: Billing setup {billing_setup_id} assigned to {customer_id}")
+                    if bs_response.result.resource_name:
+                        billing_setup_resource = bs_response.result.resource_name
+                        print(f"[DEBUG] SUCCESS: Billing setup assigned to {customer_id}: {billing_setup_resource}")
 
-                    return jsonify({
-                        "success": True,
-                        "customer_id": customer_id,
-                        "billing_setup_resource": billing_setup_resource,
-                        "billing_setup_id": billing_setup_id,
-                        "mcc_customer_id": mcc_customer_id,
-                        "message": f"Billing setup successfully assigned to customer {customer_id}.",
-                        "note": "Will be PENDING until Google approves (~1 hour). Then hard account budgets can be set.",
-                        "timestamp": datetime.utcnow().isoformat() + "Z"
-                    }), 200
+                        return jsonify({
+                            "success": True,
+                            "customer_id": customer_id,
+                            "billing_setup_resource": billing_setup_resource,
+                            "billing_setup_id": billing_setup_id,
+                            "mcc_customer_id": mcc_customer_id,
+                            "message": f"Billing setup successfully linked to customer {customer_id}.",
+                            "note": "Will be PENDING until Google approves (~1 hour). Then hard account budgets can be set.",
+                            "timestamp": datetime.utcnow().isoformat() + "Z"
+                        }), 200
 
                 except GoogleAdsException as e:
                     error_msg = str(e)
-                    print(f"[DEBUG] Billing setup {billing_setup_id} failed: {error_msg}")
+                    error_code = None
+                    if e.failure and e.failure.errors:
+                        error_code = e.failure.errors[0].error_code
                     
-                    if "BILLING_SETUP_ALREADY_EXISTS" in error_msg:
+                    print(f"[DEBUG] Billing setup {billing_setup_id} failed: {error_code} - {error_msg}")
+                    
+                    if "BILLING_SETUP_ALREADY_EXISTS" in error_msg or error_code == 76:
                         return jsonify({
                             "success": False,
-                            "errors": ["Customer already has a billing setup assigned."]
+                            "errors": ["Customer already has a billing setup assigned. Cannot assign another."]
                         }), 400
+                    
+                    # Try next billing setup ID
                     continue
 
+            # If we get here, none of the billing setup IDs worked
             return jsonify({
                 "success": False,
-                "errors": ["All configured billing setups failed. Check IDs in environment."]
+                "errors": ["All configured billing setups failed. Check environment BILLING_SETUP_ID value."]
             }), 400
 
         except Exception as e:
+            print(f"[DEBUG] Unexpected error in assign_billing_setup: {str(e)}")
             if is_network_error(e):
                 if attempt < 2:
                     time.sleep(5)
                     continue
-                return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
-            return jsonify({"success": False, "errors": [f"Unexpected error: {str(e)}"]}) , 500
+                return jsonify({
+                    "success": False,
+                    "errors": ["Network error (unable to reach Google servers). Please try again.", str(e)]
+                }), 500
+            return jsonify({
+                "success": False,
+                "errors": [f"Unexpected error: {str(e)}"]
+            }), 500
 
-    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+    return jsonify({
+        "success": False,
+        "errors": ["Max retries reached. Please try again later."]
+    }), 500
+
 
 @app.route('/update-email', methods=['POST'])
 def update_email():
