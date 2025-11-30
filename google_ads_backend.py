@@ -346,14 +346,15 @@ def approve_topup():
             operation = client.get_type("AccountBudgetProposalOperation")
             proposal = operation.create
 
-            enums = client.get_type("AccountBudgetProposalTypeEnum")
-            time_enums = client.get_type("TimeTypeEnum")
+            # FIX: Use client.enums instead of client.get_type for v22 compatibility
+            proposal_type_enum = client.enums.AccountBudgetProposalTypeEnum
+            time_type_enum = client.enums.TimeTypeEnum
 
             proposal_type_name = None
 
             if existing_budget:
                 # UPDATE existing budget
-                proposal.proposal_type = enums.UPDATE
+                proposal.proposal_type = proposal_type_enum.UPDATE
                 proposal.account_budget = existing_budget.resource_name
                 proposal.proposed_spending_limit_micros = spending_limit_micros
                 proposal.proposed_notes = (
@@ -382,15 +383,15 @@ def approve_topup():
                         break
 
                 if billing_setup_resource:
-                    proposal.proposal_type = enums.CREATE
+                    proposal.proposal_type = proposal_type_enum.CREATE
                     proposal.billing_setup = billing_setup_resource
                     proposal.proposed_spending_limit_micros = spending_limit_micros
                     proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
                     proposal.proposed_notes = (
                         f"Created via /approve-topup. Limit: {topup_amount} {customer_currency}."
                     )
-                    proposal.proposed_start_time_type = time_enums.NOW
-                    proposal.proposed_end_time_type = time_enums.FOREVER
+                    proposal.proposed_start_time_type = time_type_enum.NOW
+                    proposal.proposed_end_time_type = time_type_enum.FOREVER
                     proposal_type_name = "CREATE"
                 else:
                     print(f"[DEBUG] No APPROVED/ACTIVE billing setup found for {customer_id} in API query")
