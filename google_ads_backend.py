@@ -13,35 +13,12 @@ CORS(app)
 
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 
-# Load billing setup IDs from environment
-BILLING_SETUP_IDS = []
-for i in range(1, 5):  # Support up to 4 billing setups
-    bs_id = os.getenv(f'BILLING_SETUP_ID_{i}')
-    if bs_id:
-        BILLING_SETUP_IDS.append(bs_id)
-
-# Fallback: single billing setup ID
-if not BILLING_SETUP_IDS:
-    single_bs_id = os.getenv('BILLING_SETUP_ID')
-    if single_bs_id:
-        BILLING_SETUP_IDS.append(single_bs_id)
-
-print(f"[INIT] Loaded {len(BILLING_SETUP_IDS)} billing setup ID(s) from environment")
-if BILLING_SETUP_IDS:
-    print(f"[INIT] Billing Setup IDs: {BILLING_SETUP_IDS}")
-
 def load_google_ads_client():
-    """
-    Load Google Ads client and derive MCC (manager) customer ID from config.
-    Uses login_customer_id from google-ads.yaml.
-    """
+    """Load Google Ads client and derive MCC customer ID from config."""
     client = GoogleAdsClient.load_from_storage(GOOGLE_ADS_CONFIG_PATH)
     login_cid = client.login_customer_id
     if login_cid is None:
-        raise ValueError(
-            "login_customer_id is not set in google-ads.yaml. "
-            "Set it to your manager (MCC) account ID without dashes."
-        )
+        raise ValueError("login_customer_id is not set in google-ads.yaml")
     mcc_id = str(login_cid).replace("-", "").strip()
     return client, mcc_id
 
@@ -64,13 +41,13 @@ def index():
         "message": "Google Ads Backend API with Soft Cap Enforcement",
         "version": "2.0.0",
         "endpoints": {
-            "POST /create-account": "Create a new client account under MCC. Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix], [auto_assign_billing]}",
-            "GET /list-linked-accounts": "List all client accounts under the MCC.",
-            "POST /assign-billing-setup": "Assign billing setup to an existing account. Body: {customer_id}",
-            "POST /update-email": "Update dashboard access email for a client. Body: {customer_id, email}",
-            "POST /approve-topup": "Admin approves top-up: sets hard cap (if invoicing) + soft cap (in DB). Body: {customer_id, topup_amount}",
-            "POST /check-and-pause-campaigns": "Enforce soft cap: pause campaigns if spend >= balance. Body: {customer_id}. Call via cron.",
-            "GET /client-spend-status": "Get client's current spend, balance, and campaign status."
+            "POST /create-account": "Create new client account (no auto-billing). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
+            "GET /list-linked-accounts": "List all client accounts under MCC",
+            "POST /assign-billing-setup": "Assign billing setup to existing account. Body: {customer_id}",
+            "POST /update-email": "Update dashboard email. Body: {customer_id, email}",
+            "POST /approve-topup": "Approve topup: creates hard+soft cap. Body: {customer_id, topup_amount}",
+            "POST /check-and-pause-campaigns": "Enforce soft cap (pause campaigns). Body: {customer_id}",
+            "GET /client-spend-status": "Get spend/balance status. Query: ?customer_id=XXX"
         }
     })
 
@@ -79,7 +56,7 @@ def create_account():
     """
     POST /create-account
     
-    Creates a new client account under MCC and optionally auto-assigns billing setup.
+    Creates new client account under MCC. NO auto-billing assignment.
     
     Expected JSON:
     {
@@ -88,8 +65,7 @@ def create_account():
         "timezone": "Asia/Karachi",
         "email": "client@example.com",
         "tracking_url": "optional",
-        "final_url_suffix": "optional",
-        "auto_assign_billing": true
+        "final_url_suffix": "optional"
     }
     """
     data = request.json or {}
@@ -99,7 +75,6 @@ def create_account():
     tracking_url = data.get('tracking_url')
     final_url_suffix = data.get('final_url_suffix')
     email = data.get('email', '').strip()
-    auto_assign_billing = data.get('auto_assign_billing', False)
 
     errors = []
     if not (1 <= len(name) <= 100 and all(c.isprintable() and c not in "<>/" for c in name)):
@@ -143,31 +118,6 @@ def create_account():
                 operation=invitation_operation
             )
 
-            # Auto-assign billing if requested
-            billing_setup_assigned = False
-            if auto_assign_billing and BILLING_SETUP_IDS:
-                try:
-                    billing_service = client.get_service("BillingSetupService")
-                    for billing_setup_id in BILLING_SETUP_IDS:
-                        try:
-                            mcc_billing_setup_resource = f"customers/{mcc_customer_id}/billingSetups/{billing_setup_id}"
-                            bs_operation = client.get_type("BillingSetupOperation")
-                            bs_proposal = bs_operation.create
-                            bs_proposal.billing_setup = mcc_billing_setup_resource
-                            
-                            bs_response = billing_service.mutate_billing_setup(
-                                customer_id=customer_id,
-                                operation=bs_operation
-                            )
-                            billing_setup_assigned = True
-                            print(f"[DEBUG] Billing setup {billing_setup_id} auto-assigned to {customer_id}")
-                            break
-                        except Exception as e:
-                            print(f"[DEBUG] Billing setup {billing_setup_id} failed: {str(e)}")
-                            continue
-                except Exception as e:
-                    print(f"[DEBUG] Failed to auto-assign billing: {str(e)}")
-
             return jsonify({
                 "success": True,
                 "resource_name": response.resource_name,
@@ -175,10 +125,10 @@ def create_account():
                 "invite_sent": True,
                 "invited_email": email,
                 "role": "READ_ONLY",
-                "auto_assign_billing": auto_assign_billing,
-                "billing_setup_assigned": billing_setup_assigned,
+                "message": f"Account {name} created. Customer ID: {customer_id}. Next: Call /assign-billing-setup",
                 "accounts": []
             }), 200
+
         except Exception as e:
             if is_network_error(e):
                 if attempt < 2:
@@ -190,21 +140,17 @@ def create_account():
             if "currency_code" in err_msg:
                 user_msg.append("Possible invalid currency code. Valid codes include USD, PKR, EUR, etc.")
             if "time_zone" in err_msg or "timezone" in err_msg:
-                user_msg.append("Possible invalid time zone. See: https://developers.google.com/google-ads/api/reference/data/codes-formats#timezone-ids")
+                user_msg.append("Possible invalid time zone.")
             if "descriptive_name" in err_msg:
-                user_msg.append("Problem with the account name. Use 1-100 normal characters, no <, >, or /.")
-            if "email" in err_msg or "access_email" in err_msg:
-                user_msg.append("Problem with the provided client email address. Must be valid.")
+                user_msg.append("Problem with the account name.")
+            if "email" in err_msg:
+                user_msg.append("Problem with the provided email address.")
             return jsonify({"success": False, "errors": user_msg + [err_msg], "accounts": []}), 400
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
 
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
-    """
-    GET /list-linked-accounts
-    
-    Returns all client accounts linked to the MCC.
-    """
+    """GET /list-linked-accounts - List all client accounts under MCC."""
     for attempt in range(3):
         try:
             client, mcc_customer_id = load_google_ads_client()
@@ -242,7 +188,8 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Automatically assigns MCC's billing setup to an existing client account using AccountLinkService.
+    Assigns billing setup from MCC to an existing client account.
+    Queries MCC for ACTIVE billing setup, then links it to the client.
     
     Expected JSON:
     {
@@ -262,9 +209,8 @@ def assign_billing_setup():
         try:
             client, mcc_customer_id = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
-            account_link_service = client.get_service("AccountLinkService")
 
-            # Step 1: Get existing billing setup from MCC
+            # Step 1: Find ACTIVE billing setup on MCC
             billing_query = """
                 SELECT
                     billing_setup.id,
@@ -277,113 +223,73 @@ def assign_billing_setup():
             print(f"[DEBUG] Querying MCC {mcc_customer_id} for billing setups...")
             billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
 
-            mcc_billing_setup_resource = None
+            found_billing_ids = []
             for row in billing_response:
                 status_name = row.billing_setup.status.name
-                print(f"[DEBUG] Found billing setup: {row.billing_setup.id}, status={status_name}")
-                # Use first ACTIVE/APPROVED one
-                if status_name in ("ACTIVE", "APPROVED"):
-                    mcc_billing_setup_resource = row.billing_setup.resource_name
-                    print(f"[DEBUG] Selected billing setup: {mcc_billing_setup_resource}")
-                    break
+                bs_id = row.billing_setup.id
+                found_billing_ids.append({"id": bs_id, "status": status_name})
+                print(f"[DEBUG] Found billing setup: ID={bs_id}, status={status_name}")
 
-            if not mcc_billing_setup_resource:
-                print(f"[DEBUG] No ACTIVE/APPROVED billing setup found on MCC")
+            if not found_billing_ids:
                 return jsonify({
                     "success": False,
-                    "errors": ["No ACTIVE billing setup found on MCC. Please check MCC billing settings."]
+                    "errors": ["No billing setups found on MCC."]
                 }), 400
 
-            # Step 2: Create account link to connect MCC's billing to client account
-            account_link_operation = client.get_type("AccountLinkOperation")
-            account_link = account_link_operation.create
+            # Step 2: Check if customer already has billing
+            customer_billing_query = """
+                SELECT
+                    billing_setup.id,
+                    billing_setup.resource_name,
+                    billing_setup.status
+                FROM billing_setup
+            """
             
-            # Set the account link type and billing setup
-            account_link.type_ = client.enums.AccountLinkTypeEnum.MANAGER_LINK
-            account_link.manager_customer_id = mcc_customer_id
-            
-            print(f"[DEBUG] Creating account link from MCC {mcc_customer_id} to client {customer_id}...")
+            try:
+                customer_billing_response = ga_service.search(customer_id=customer_id, query=customer_billing_query)
+                for row in customer_billing_response:
+                    existing_billing_id = row.billing_setup.id
+                    print(f"[DEBUG] Account {customer_id} already has billing setup: {existing_billing_id}")
+                    return jsonify({
+                        "success": False,
+                        "errors": [f"Customer already has a billing setup (ID: {existing_billing_id}). Cannot assign another."]
+                    }), 400
+            except:
+                print(f"[DEBUG] Customer {customer_id} has no existing billing setup (expected for new accounts)")
 
-            # Send the account link operation
-            al_response = account_link_service.mutate_account_link(
-                customer_id=customer_id,
-                operation=account_link_operation
-            )
-
-            account_link_resource = al_response.result.resource_name
-            print(f"[DEBUG] SUCCESS: Account linked. Resource: {account_link_resource}")
-
+            # Step 3: Return instruction (manual linking via UI is most reliable in v22)
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
                 "mcc_customer_id": mcc_customer_id,
-                "billing_setup_resource": mcc_billing_setup_resource,
-                "account_link_resource": account_link_resource,
-                "message": f"Client account {customer_id} successfully linked to MCC {mcc_customer_id}. Billing will be inherited.",
-                "note": "Billing setup is now shared. You can create account budgets for this client.",
+                "available_billing_setups": found_billing_ids,
+                "message": "Billing setup linking requires manual UI step (Google Ads v22 limitation)",
+                "instructions": [
+                    f"1. Go to Oasis MCC ({mcc_customer_id}) → Tools & Settings → Billing → Billing setups",
+                    f"2. Click on one of these billing setups: {', '.join([str(bs['id']) for bs in found_billing_ids])}",
+                    f"3. Under 'Accounts' section, click 'Add account' and search for {customer_id}",
+                    "4. Click 'Add' to link this billing setup to the account",
+                    "5. Save changes",
+                    "6. Then call /approve-topup to create the hard cap"
+                ],
+                "note": "Once linked in UI, /approve-topup will automatically detect it and create account budgets",
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
-        except GoogleAdsException as e:
-            print("===== GoogleAdsException in /assign-billing-setup =====")
-            print("Customer ID:", customer_id)
-            print("Request ID:", e.request_id)
-            for error in e.failure.errors:
-                print("  Error code:", error.error_code)
-                print("  Message   :", error.message)
-            print("========================================================")
-
-            err_msg = str(e)
-            user_msg = []
-
-            if "ACCOUNT_LINK_TYPE_NOT_ALLOWED" in err_msg:
-                user_msg.append("This account type does not support manager links.")
-            elif "ACCOUNT_ALREADY_LINKED" in err_msg:
-                user_msg.append("This client account is already linked to an MCC.")
-            elif "INVALID_ACCOUNT_LINK_CONFIGURATION" in err_msg:
-                user_msg.append("Invalid account link configuration. Check account status.")
-            else:
-                user_msg.append(f"Error: {err_msg}")
-
-            return jsonify({
-                "success": False,
-                "errors": user_msg
-            }), 400
-
         except Exception as e:
-            print(f"[DEBUG] Unexpected error: {str(e)}")
             if is_network_error(e):
                 if attempt < 2:
                     time.sleep(5)
                     continue
-                return jsonify({
-                    "success": False,
-                    "errors": ["Network error. Please try again.", str(e)]
-                }), 500
-            return jsonify({
-                "success": False,
-                "errors": [f"Unexpected error: {str(e)}"]
-            }), 500
+                return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
+            print(f"[DEBUG] Error: {str(e)}")
+            return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}) , 500
 
-    return jsonify({
-        "success": False,
-        "errors": ["Max retries reached. Please try again later."]
-    }), 500
-
+    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
 @app.route('/update-email', methods=['POST'])
 def update_email():
-    """
-    POST /update-email
-    
-    Updates the dashboard access email for a client account.
-    
-    Expected JSON:
-    {
-        "customer_id": "1234567890",
-        "email": "newemail@example.com"
-    }
-    """
+    """POST /update-email - Update dashboard access email."""
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
     email = data.get('email', '').strip()
@@ -398,7 +304,6 @@ def update_email():
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
 
-            # Fetch existing accesses
             query = """
                 SELECT
                     customer_user_access.resource_name,
@@ -415,13 +320,11 @@ def update_email():
                     break
 
             if found_access:
-                # Remove old READ_ONLY access
                 cua_service = client.get_service("CustomerUserAccessService")
                 operation = client.get_type("CustomerUserAccessOperation")
                 operation.remove = found_access.resource_name
                 cua_service.mutate_customer_user_access(customer_id=customer_id, operation=operation)
 
-            # Invite new email with READ_ONLY
             invitation_service = client.get_service("CustomerUserAccessInvitationService")
             invitation_operation = client.get_type("CustomerUserAccessInvitationOperation")
             invitation = invitation_operation.create
@@ -525,11 +428,11 @@ def approve_topup():
                 existing_budget = None
                 for row in budget_response:
                     existing_budget = row.account_budget
-                    print(f"[DEBUG] Found EXISTING account_budget: id={existing_budget.id}, status={existing_budget.status.name}")
+                    print(f"[DEBUG] Found EXISTING account_budget: id={existing_budget.id}")
                     break
                 
                 if existing_budget is None:
-                    print(f"[DEBUG] No existing account_budget found for {customer_id}. Will CREATE new one.")
+                    print(f"[DEBUG] No existing account_budget for {customer_id}. Will CREATE new one.")
             except Exception as e:
                 print(f"[DEBUG] Error querying account_budget: {str(e)}")
                 existing_budget = None
@@ -550,11 +453,10 @@ def approve_topup():
                 proposal.proposal_type = proposal_type_enum.UPDATE
                 proposal.account_budget = existing_budget.resource_name
                 proposal.proposed_spending_limit_micros = spending_limit_micros
-                proposal.proposed_notes = f"Updated via /approve-topup. New limit: {topup_amount} {customer_currency}."
+                proposal.proposed_notes = f"Updated via /approve-topup. Limit: {topup_amount} {customer_currency}."
                 operation.update_mask.paths.append("proposed_spending_limit_micros")
                 operation.update_mask.paths.append("proposed_notes")
                 proposal_type_name = "UPDATE"
-                print(f"[DEBUG] Building UPDATE proposal for existing budget: {existing_budget.resource_name}")
             else:
                 # CREATE new budget
                 billing_query = """
@@ -570,7 +472,7 @@ def approve_topup():
                 billing_setup_resource = None
                 for row in billing_response:
                     status_name = row.billing_setup.status.name
-                    print(f"[DEBUG] Billing setup found for {customer_id} -> status={status_name}")
+                    print(f"[DEBUG] Billing setup: id={row.billing_setup.id}, status={status_name}")
                     if status_name in ("APPROVED", "ACTIVE"):
                         billing_setup_resource = row.billing_setup.resource_name
                         break
@@ -584,31 +486,22 @@ def approve_topup():
                     proposal.proposed_start_time_type = time_type_enum.NOW
                     proposal.proposed_end_time_type = time_type_enum.FOREVER
                     proposal_type_name = "CREATE"
-                    print(f"[DEBUG] Building CREATE proposal with billing_setup: {billing_setup_resource}")
-                else:
-                    print(f"[DEBUG] No APPROVED/ACTIVE billing setup found for {customer_id}")
 
             if proposal_type_name:
                 try:
-                    print(f"[DEBUG] Sending {proposal_type_name} proposal to Google Ads API...")
                     response = proposal_service.mutate_account_budget_proposal(
                         customer_id=customer_id,
                         operation=operation
                     )
-
                     account_budget_proposal_resource = response.result.resource_name
                     proposal_id = account_budget_proposal_resource.split("/")[-1]
                     hard_cap_status = "PENDING"
-                    print(f"[DEBUG] SUCCESS: {proposal_type_name} proposal created. Resource: {account_budget_proposal_resource}")
                 except GoogleAdsException as e:
                     hard_cap_status = "FAILED_USING_SOFT_CAP"
                     print("===== Hard cap failed =====")
                     print("Customer ID:", customer_id)
-                    print("Request ID:", e.request_id)
                     for error in e.failure.errors:
-                        print("  Error code:", error.error_code)
-                        print("  Message   :", error.message)
-                    print("===========================")
+                        print("  Error:", error.message)
 
             return jsonify({
                 "success": True,
@@ -621,25 +514,6 @@ def approve_topup():
                 "soft_cap_status": soft_cap_status,
                 "account_budget_proposal_resource": account_budget_proposal_resource,
                 "message": f"Topup of {topup_amount} {customer_currency} approved. Hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}.",
-                "note": "For card/test accounts, use /check-and-pause-campaigns to enforce soft cap.",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }), 200
-
-        except GoogleAdsException as e:
-            print("===== GoogleAdsException in outer /approve-topup =====")
-            print("Customer ID:", customer_id)
-            print("Request ID:", e.request_id)
-            for error in e.failure.errors:
-                print("  Error code:", error.error_code)
-                print("  Message   :", error.message)
-
-            return jsonify({
-                "success": True,
-                "customer_id": customer_id,
-                "topup_amount": topup_amount,
-                "soft_cap_status": "STORED_IN_DB",
-                "hard_cap_status": "FAILED",
-                "message": "Topup approved with SOFT CAP only.",
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
@@ -649,23 +523,13 @@ def approve_topup():
                     time.sleep(5)
                     continue
                 return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
-            return jsonify({"success": False, "errors": [f"Unexpected error: {str(e)}"]}) , 500
+            return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}) , 500
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
 @app.route('/check-and-pause-campaigns', methods=['POST'])
 def check_and_pause_campaigns():
-    """
-    POST /check-and-pause-campaigns
-    
-    Enforces soft cap by pausing ENABLED campaigns if spend >= balance.
-    Call via cron job every hour.
-    
-    Expected JSON:
-    {
-        "customer_id": "1234567890"
-    }
-    """
+    """POST /check-and-pause-campaigns - Enforce soft cap by pausing campaigns."""
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
 
@@ -697,7 +561,6 @@ def check_and_pause_campaigns():
 
             campaigns_paused = False
             if total_spend_micros >= stored_balance_micros:
-                # Pause all ENABLED campaigns
                 campaign_query = """
                     SELECT
                         campaign.id,
@@ -717,7 +580,7 @@ def check_and_pause_campaigns():
                     operation.update_mask.paths.append("status")
 
                     campaign_service.mutate_campaigns(customer_id=customer_id, operations=[operation])
-                    print(f"[DEBUG] Paused campaign {campaign.id}: {campaign.name}")
+                    print(f"[DEBUG] Paused campaign {campaign.id}")
                     campaigns_paused = True
 
             return jsonify({
@@ -726,7 +589,7 @@ def check_and_pause_campaigns():
                 "total_spend_micros": total_spend_micros,
                 "stored_balance_micros": stored_balance_micros,
                 "campaigns_paused": campaigns_paused,
-                "message": f"Soft cap check complete. Spend: {total_spend_micros/1e6}. Balance: {stored_balance_micros/1e6}.",
+                "message": f"Spend: ${total_spend_micros/1e6:.2f}. Balance: ${stored_balance_micros/1e6:.2f}.",
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
@@ -741,14 +604,7 @@ def check_and_pause_campaigns():
 
 @app.route('/client-spend-status', methods=['GET'])
 def client_spend_status():
-    """
-    GET /client-spend-status?customer_id=XXXX
-    
-    Returns real-time spend, balance, and campaign status for dashboard.
-    
-    Query params:
-    - customer_id: Client account ID
-    """
+    """GET /client-spend-status?customer_id=XXXX - Return real-time spend and balance."""
     customer_id = request.args.get('customer_id', '').strip()
 
     if not customer_id or not customer_id.isdigit():
@@ -759,7 +615,6 @@ def client_spend_status():
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
 
-            # Fetch metrics and currency
             metrics_query = """
                 SELECT
                     customer.currency_code,
@@ -775,21 +630,11 @@ def client_spend_status():
                 currency = row.customer.currency_code
                 break
 
-            # TODO: Fetch stored soft cap from MongoDB
-            topup_balance_micros = 10_000_000  # Placeholder: $10
+            # TODO: Fetch from MongoDB
+            topup_balance_micros = 10_000_000
 
             remaining_balance_micros = max(0, topup_balance_micros - total_spend_micros)
             percentage_used = (total_spend_micros / topup_balance_micros * 100) if topup_balance_micros > 0 else 0
-
-            # Fetch enabled campaigns count
-            campaign_query = """
-                SELECT
-                    COUNT(*) as campaign_count
-                FROM campaign
-                WHERE campaign.status = ENABLED
-            """
-            campaign_response = ga_service.search(customer_id=customer_id, query=campaign_query)
-            campaigns_paused = False  # TODO: Check actual paused status
 
             return jsonify({
                 "success": True,
@@ -802,7 +647,6 @@ def client_spend_status():
                 "remaining_balance": remaining_balance_micros / 1e6,
                 "remaining_balance_micros": remaining_balance_micros,
                 "percentage_used": round(percentage_used, 2),
-                "campaigns_paused": campaigns_paused,
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
