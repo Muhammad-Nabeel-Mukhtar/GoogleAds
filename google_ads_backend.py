@@ -317,20 +317,9 @@ def approve_topup():
                 }), 400
 
             # ===== SOFT CAP: Store topup in your DB (simulated here) =====
-            # IN PRODUCTION: Save to MongoDB like:
-            # db.clients.update_one(
-            #     {"customer_id": customer_id},
-            #     {"$set": {
-            #         "topup_balance_micros": spending_limit_micros,
-            #         "topup_amount": topup_amount,
-            #         "currency": customer_currency,
-            #         "topup_date": datetime.utcnow(),
-            #         "campaigns_paused": False
-            #     }}
-            # )
             soft_cap_status = "STORED_IN_DB"  # This is where you'd store to MongoDB
 
-            # Step 3: check existing account_budget in client account (may fail for card accounts)
+            # Step 3: check existing account_budget in client account
             budget_query = """
                 SELECT
                     account_budget.id,
@@ -387,6 +376,8 @@ def approve_topup():
                 billing_setup_resource = None
                 for row in billing_response:
                     status_name = row.billing_setup.status.name
+                    # DEBUG: log every billing setup status we see
+                    print(f"[DEBUG] Billing setup found for {customer_id} -> status={status_name}, resource={row.billing_setup.resource_name}")
                     if status_name in ("APPROVED", "ACTIVE"):
                         billing_setup_resource = row.billing_setup.resource_name
                         break
@@ -402,6 +393,8 @@ def approve_topup():
                     proposal.proposed_start_time_type = time_enums.NOW
                     proposal.proposed_end_time_type = time_enums.FOREVER
                     proposal_type_name = "CREATE"
+                else:
+                    print(f"[DEBUG] No APPROVED/ACTIVE billing setup found for {customer_id} in API query")
 
             if proposal_type_name:
                 try:
@@ -415,9 +408,15 @@ def approve_topup():
                     proposal_id = account_budget_proposal_resource.split("/")[-1]
                     hard_cap_status = "PENDING"  # Google will approve asynchronously
                 except GoogleAdsException as e:
-                    # Hard cap failed (expected for card accounts), fall back to soft cap only
+                    # Hard cap failed (card accounts / permission / config issues)
                     hard_cap_status = "FAILED_USING_SOFT_CAP"
-                    print(f"Hard cap failed for {customer_id}: {e}")
+                    print("===== Hard cap failed in inner mutate_account_budget_proposal =====")
+                    print("Customer ID:", customer_id)
+                    print("Request ID:", e.request_id)
+                    for error in e.failure.errors:
+                        print("  Error code:", error.error_code)
+                        print("  Message   :", error.message)
+                    print("===============================================================")
 
             return jsonify({
                 "success": True,
@@ -441,11 +440,13 @@ def approve_topup():
 
         except GoogleAdsException as e:
             # General Google Ads errors during approval
-            print("GoogleAdsException in /approve-topup")
+            print("===== GoogleAdsException in outer /approve-topup try-block =====")
+            print("Customer ID:", customer_id)
             print("Request ID:", e.request_id)
             for error in e.failure.errors:
                 print("  Error code:", error.error_code)
                 print("  Message   :", error.message)
+            print("===============================================================")
 
             err_msg = str(e)
             user_msg = []
@@ -500,6 +501,7 @@ def approve_topup():
         "success": False,
         "errors": ["Max network retries reached. Please try again later."]
     }), 500
+
 
 @app.route('/check-and-pause-campaigns', methods=['POST'])
 def check_and_pause_campaigns():
