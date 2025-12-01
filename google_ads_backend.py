@@ -263,136 +263,63 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Links the MCC's payments profile to a client account via API.
-    Uses PaymentsProfileId from environment variable.
-    
-    Expected JSON:
-    {
-        "customer_id": "5173162060"
-    }
+    Correctly links the MCC's Payments Profile to a client account via API.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
+    
+    # Use your profile ID without dashes
+    payments_profile_id = "971027154283" 
 
     if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id is required."]}), 400
+
+    try:
+        client, mcc_customer_id = load_google_ads_client()
+        billing_setup_service = client.get_service("BillingSetupService")
+        
+        # 1. Create the operation
+        operation = client.get_type("BillingSetupOperation")
+        
+        # 2. Configure the BillingSetup object
+        # IMPORTANT: Do NOT use client.get_type("PaymentsAccountInfo")
+        # Access .payments_account_info directly on the .create object
+        
+        billing_setup = operation.create
+        
+        # 3. Set the Payments Profile ID here
+        billing_setup.payments_account_info.payments_profile_id = payments_profile_id
+        billing_setup.payments_account_info.payments_account_name = f"Billing Setup for {customer_id}"
+        
+        # 4. Set start time (Required)
+        billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"[ASSIGN-BILLING] Linking Profile {payments_profile_id} to {customer_id}...")
+
+        # 5. Execute
+        response = billing_setup_service.mutate_billing_setup(
+            customer_id=customer_id,
+            operation=operation
+        )
+        
+        new_resource = response.result.resource_name
+        print(f"[ASSIGN-BILLING] SUCCESS! Created: {new_resource}")
+
         return jsonify({
-            "success": False,
-            "errors": ["Valid numeric customer_id is required."]
-        }), 400
+            "success": True,
+            "customer_id": customer_id,
+            "billing_setup_resource": new_resource,
+            "message": "✅ Successfully linked Payments Profile via API.",
+            "next_step": "/approve-topup"
+        }), 200
 
-    # Get payments profile ID from environment
-    payments_profile_id = os.getenv('BILLING_SETUP_ID')  # e.g., "971027154283"
-    if not payments_profile_id:
-        return jsonify({
-            "success": False,
-            "errors": ["BILLING_SETUP_ID (Payments Profile ID) not configured in environment."]
-        }), 500
+    except GoogleAdsException as e:
+        print(f"[ASSIGN-BILLING] API Error: {e}")
+        return jsonify({"success": False, "errors": [str(e)]}), 400
+    except Exception as e:
+        print(f"[ASSIGN-BILLING] Error: {e}")
+        return jsonify({"success": False, "errors": [str(e)]}), 500
 
-    for attempt in range(3):
-        try:
-            client, mcc_customer_id = load_google_ads_client()
-            ga_service = client.get_service("GoogleAdsService")
-            billing_setup_service = client.get_service("BillingSetupService")
-
-            print(f"\n[ASSIGN-BILLING] Starting...")
-            print(f"[ASSIGN-BILLING] MCC ID: {mcc_customer_id}")
-            print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
-            print(f"[ASSIGN-BILLING] Payments Profile ID: {payments_profile_id}")
-
-            # Step 1: Check if customer already has a billing setup
-            try:
-                customer_billing_query = """
-                    SELECT
-                        billing_setup.id,
-                        billing_setup.resource_name,
-                        billing_setup.status
-                    FROM billing_setup
-                """
-                customer_billing_response = ga_service.search(customer_id=customer_id, query=customer_billing_query)
-                
-                for row in customer_billing_response:
-                    existing_bs_id = row.billing_setup.id
-                    print(f"[ASSIGN-BILLING] Already has billing setup: {existing_bs_id}")
-                    return jsonify({
-                        "success": False,
-                        "errors": [f"Customer already has billing setup (ID: {existing_bs_id})"]
-                    }), 400
-            except:
-                print(f"[ASSIGN-BILLING] No existing billing setup (expected for new accounts)")
-
-            # Step 2: Build BillingSetup with PaymentsAccountInfo
-            operation = client.get_type("BillingSetupOperation")
-            billing_setup = operation.create
-
-            # Create PaymentsAccountInfo with the payments profile ID
-            payments_account_info = client.get_type("PaymentsAccountInfo")
-            payments_account_info.payments_profile_id = payments_profile_id
-
-            billing_setup.payments_account_info = payments_account_info
-
-            print(f"[ASSIGN-BILLING] Creating billing setup with payments_profile_id: {payments_profile_id}...")
-
-            # Step 3: Execute mutation
-            response = billing_setup_service.mutate_billing_setup(
-                customer_id=customer_id,
-                operation=operation
-            )
-
-            if response.result and response.result.resource_name:
-                new_bs_resource = response.result.resource_name
-                new_bs_id = new_bs_resource.split("/")[-1]
-                
-                print(f"[ASSIGN-BILLING] SUCCESS! Resource: {new_bs_resource}\n")
-
-                return jsonify({
-                    "success": True,
-                    "customer_id": customer_id,
-                    "mcc_customer_id": mcc_customer_id,
-                    "payments_profile_id": payments_profile_id,
-                    "billing_setup_resource": new_bs_resource,
-                    "billing_setup_id": new_bs_id,
-                    "message": f"✅ Payments Profile successfully linked to customer {customer_id}.",
-                    "status": "PENDING",
-                    "note": "Google will approve within ~1 hour. Then call /approve-topup.",
-                    "next_step": f"Call /approve-topup with customer_id={customer_id} and topup_amount=10",
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                }), 200
-
-        except GoogleAdsException as e:
-            error_msg = str(e)
-            print(f"[ASSIGN-BILLING] GoogleAdsException: {error_msg}\n")
-            
-            user_msg = []
-            if "BILLING_SETUP_ALREADY_EXISTS" in error_msg:
-                user_msg.append("Customer already has a billing setup assigned.")
-            elif "PAYMENTS_PROFILE_NOT_FOUND" in error_msg:
-                user_msg.append(f"Payments Profile {payments_profile_id} not found or not linked to MCC.")
-            else:
-                user_msg.append(f"Error: {error_msg}")
-
-            return jsonify({
-                "success": False,
-                "errors": user_msg
-            }), 400
-
-        except Exception as e:
-            if is_network_error(e):
-                if attempt < 2:
-                    time.sleep(5)
-                    continue
-                return jsonify({
-                    "success": False,
-                    "errors": ["Network error. Please try again."]
-                }), 500
-            return jsonify({
-                "success": False,
-                "errors": [f"Error: {str(e)}"]
-            }), 500
-
-    return jsonify({
-        "success": False,
-        "errors": ["Max retries reached."]
-    }), 500
 
 
 @app.route('/update-email', methods=['POST'])
