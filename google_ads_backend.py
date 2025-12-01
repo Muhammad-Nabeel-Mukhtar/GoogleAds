@@ -263,62 +263,95 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Correctly links the MCC's Payments Profile to a client account via API.
+    Links the MCC's Payments Profile to a client account via API.
+    Uses the correct resource name format for payments_profile_id.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
-    
-    # Use your profile ID without dashes
-    payments_profile_id = "971027154283" 
 
     if not customer_id or not customer_id.isdigit():
         return jsonify({"success": False, "errors": ["Valid numeric customer_id is required."]}), 400
 
-    try:
-        client, mcc_customer_id = load_google_ads_client()
-        billing_setup_service = client.get_service("BillingSetupService")
-        
-        # 1. Create the operation
-        operation = client.get_type("BillingSetupOperation")
-        
-        # 2. Configure the BillingSetup object
-        # IMPORTANT: Do NOT use client.get_type("PaymentsAccountInfo")
-        # Access .payments_account_info directly on the .create object
-        
-        billing_setup = operation.create
-        
-        # 3. Set the Payments Profile ID here
-        billing_setup.payments_account_info.payments_profile_id = payments_profile_id
-        billing_setup.payments_account_info.payments_account_name = f"Billing Setup for {customer_id}"
-        
-        # 4. Set start time (Required)
-        billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        
-        print(f"[ASSIGN-BILLING] Linking Profile {payments_profile_id} to {customer_id}...")
+    for attempt in range(3):
+        try:
+            client, mcc_customer_id = load_google_ads_client()
+            ga_service = client.get_service("GoogleAdsService")
+            billing_setup_service = client.get_service("BillingSetupService")
 
-        # 5. Execute
-        response = billing_setup_service.mutate_billing_setup(
-            customer_id=customer_id,
-            operation=operation
-        )
-        
-        new_resource = response.result.resource_name
-        print(f"[ASSIGN-BILLING] SUCCESS! Created: {new_resource}")
+            print(f"\n[ASSIGN-BILLING] Starting...")
+            print(f"[ASSIGN-BILLING] MCC ID: {mcc_customer_id}")
+            print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
 
-        return jsonify({
-            "success": True,
-            "customer_id": customer_id,
-            "billing_setup_resource": new_resource,
-            "message": "✅ Successfully linked Payments Profile via API.",
-            "next_step": "/approve-topup"
-        }), 200
+            # Step 1: Query the MCC's billing setups to get the correct resource
+            billing_query = """
+                SELECT
+                    billing_setup.resource_name,
+                    billing_setup.id,
+                    billing_setup.status
+                FROM billing_setup
+                WHERE billing_setup.status = APPROVED
+                LIMIT 1
+            """
+            billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+            
+            mcc_billing_setup_resource = None
+            for row in billing_response:
+                mcc_billing_setup_resource = row.billing_setup.resource_name
+                print(f"[ASSIGN-BILLING] Found MCC billing setup: {mcc_billing_setup_resource}")
+                break
+            
+            if not mcc_billing_setup_resource:
+                return jsonify({
+                    "success": False,
+                    "errors": ["No APPROVED billing setup found on MCC. Link manually first."]
+                }), 400
 
-    except GoogleAdsException as e:
-        print(f"[ASSIGN-BILLING] API Error: {e}")
-        return jsonify({"success": False, "errors": [str(e)]}), 400
-    except Exception as e:
-        print(f"[ASSIGN-BILLING] Error: {e}")
-        return jsonify({"success": False, "errors": [str(e)]}), 500
+            # Step 2: Create billing setup for child account using the MCC's resource
+            operation = client.get_type("BillingSetupOperation")
+            billing_setup = operation.create
+
+            # THIS IS THE KEY FIX: Use the resource name directly, not payments_profile_id
+            billing_setup.billing_setup = mcc_billing_setup_resource
+
+            print(f"[ASSIGN-BILLING] Linking {mcc_billing_setup_resource} to {customer_id}...")
+
+            response = billing_setup_service.mutate_billing_setup(
+                customer_id=customer_id,
+                operation=operation
+            )
+
+            new_resource = response.result.resource_name
+            print(f"[ASSIGN-BILLING] SUCCESS! Created: {new_resource}\n")
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "mcc_billing_setup": mcc_billing_setup_resource,
+                "new_billing_setup": new_resource,
+                "message": "✅ Successfully linked billing setup via API.",
+                "status": "PENDING",
+                "next_step": f"/approve-topup with customer_id={customer_id}",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            error_msg = str(e)
+            print(f"[ASSIGN-BILLING] GoogleAdsException: {error_msg}\n")
+            
+            if "BILLING_SETUP_ALREADY_EXISTS" in error_msg:
+                return jsonify({"success": False, "errors": ["Customer already has a billing setup."]}), 400
+            
+            return jsonify({"success": False, "errors": [str(e)]}), 400
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({"success": False, "errors": ["Network error. Try again."]}), 500
+            return jsonify({"success": False, "errors": [str(e)]}), 500
+
+    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
 
 
