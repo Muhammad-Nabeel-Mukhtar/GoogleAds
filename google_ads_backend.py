@@ -263,8 +263,8 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Assigns billing setup to client account using payments profile ID.
-    Uses BillingSetupService to link the MCC's payments profile.
+    Assigns billing setup to client account using payments account ID and profile ID.
+    Uses BillingSetupService to link the MCC's payments profile and account.
     
     Expected JSON: {customer_id: "1234567890"}
     """
@@ -283,16 +283,18 @@ def assign_billing_setup():
             print(f"[ASSIGN-BILLING] MCC ID: {mcc_customer_id}")
             print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
             print(f"[ASSIGN-BILLING] Payments Profile ID: {PAYMENTS_PROFILE_ID}")
+            print(f"[ASSIGN-BILLING] Payments Account ID: {PAYMENTS_ACCOUNT_ID}")
 
-            # Create billing setup operation using payments profile ID
+            # Create billing setup operation using payments account ID and profile ID
             operation = client.get_type("BillingSetupOperation")
             billing_setup = operation.create
 
-            # Set payments profile ID (12 digits, no dashes)
+            # Set both payments account ID (with dashes) and payments profile ID (no dashes)
+            billing_setup.payments_account_info.payments_account_id = PAYMENTS_ACCOUNT_ID
             billing_setup.payments_account_info.payments_profile_id = PAYMENTS_PROFILE_ID
             billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
 
-            print(f"[ASSIGN-BILLING] Creating billing setup with payments profile {PAYMENTS_PROFILE_ID}...")
+            print(f"[ASSIGN-BILLING] Creating billing setup with account {PAYMENTS_ACCOUNT_ID} and profile {PAYMENTS_PROFILE_ID}...")
 
             response = billing_setup_service.mutate_billing_setup(
                 customer_id=customer_id,
@@ -305,6 +307,7 @@ def assign_billing_setup():
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
+                "payments_account_id": PAYMENTS_ACCOUNT_ID,
                 "payments_profile_id": PAYMENTS_PROFILE_ID,
                 "new_billing_setup": new_resource,
                 "message": "✅ Successfully linked billing setup via API.",
