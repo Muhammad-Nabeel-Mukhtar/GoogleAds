@@ -152,55 +152,73 @@ def create_account():
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
 
 
-@app.route('/debug-assign-billing', methods=['POST'])
-def debug_assign_billing():
-    """Debug version of assign-billing-setup with full error details."""
-    import traceback
-    
-    data = request.json or {}
-    customer_id = str(data.get('customer_id', '')).strip()
+@app.route('/debug-billing-from-mcc', methods=['GET'])
+def debug_billing_from_mcc():
+    """
+    GET /debug-billing-from-mcc
 
-    if not customer_id or not customer_id.isdigit():
-        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+    Debug MCC-level billing setups and payments accounts.
+    Uses login_customer_id (MCC) as context and prints everything useful.
+    """
+    import traceback
 
     try:
         client, mcc_customer_id = load_google_ads_client()
-        billing_setup_service = client.get_service("BillingSetupService")
+        ga_service = client.get_service("GoogleAdsService")
 
-        print(f"\n[DEBUG] MCC ID: {mcc_customer_id}")
-        print(f"[DEBUG] Client ID: {customer_id}")
-        print(f"[DEBUG] Payments Profile ID: {PAYMENTS_PROFILE_ID}")
+        print("\n[DEBUG-BILLING-MCC] Using MCC (login_customer_id):", mcc_customer_id)
+        print("[DEBUG-BILLING-MCC] Payments Profile ID env:", PAYMENTS_PROFILE_ID)
 
-        operation = client.get_type("BillingSetupOperation")
-        billing_setup = operation.create
+        # 1) List all billing setups on the MCC
+        billing_query = """
+            SELECT
+              billing_setup.id,
+              billing_setup.resource_name,
+              billing_setup.status,
+              billing_setup.payments_account,
+              billing_setup.payments_account_info.payments_account_id,
+              billing_setup.payments_account_info.payments_account_name,
+              billing_setup.payments_account_info.payments_profile_id
+            FROM billing_setup
+            ORDER BY billing_setup.id
+        """
 
-        billing_setup.payments_account_info.payments_profile_id = PAYMENTS_PROFILE_ID
-        billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
-
-        print(f"[DEBUG] Created operation, calling API...")
-
-        response = billing_setup_service.mutate_billing_setup(
-            customer_id=customer_id,
-            operation=operation
-        )
-
-        new_resource = response.result.resource_name
-        print(f"[DEBUG] SUCCESS: {new_resource}")
+        billing_setups = []
+        try:
+            response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
+            for row in response:
+                bs = row.billing_setup
+                item = {
+                    "id": bs.id,
+                    "resource_name": bs.resource_name,
+                    "status": bs.status.name,
+                    "payments_account": bs.payments_account,
+                    "payments_account_id": bs.payments_account_info.payments_account_id,
+                    "payments_account_name": bs.payments_account_info.payments_account_name,
+                    "payments_profile_id": bs.payments_account_info.payments_profile_id,
+                }
+                print("[DEBUG-BILLING-MCC] BillingSetup:", item)
+                billing_setups.append(item)
+        except Exception as e:
+            print("[DEBUG-BILLING-MCC] Error querying billing_setup:", str(e))
+            traceback.print_exc()
 
         return jsonify({
             "success": True,
-            "customer_id": customer_id,
-            "new_billing_setup": new_resource,
-            "message": "✅ Successfully linked billing setup via API."
+            "mcc_customer_id": mcc_customer_id,
+            "payments_profile_id_env": PAYMENTS_PROFILE_ID,
+            "billing_setups_count": len(billing_setups),
+            "billing_setups": billing_setups,
         }), 200
 
     except Exception as e:
-        print(f"[DEBUG] FULL ERROR:\n{traceback.format_exc()}")
+        import traceback
+        print("[DEBUG-BILLING-MCC] FATAL ERROR:", str(e))
+        traceback.print_exc()
         return jsonify({
             "success": False,
             "error": str(e),
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
         }), 500
 
 
