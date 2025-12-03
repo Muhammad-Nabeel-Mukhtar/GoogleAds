@@ -12,6 +12,7 @@ app = Flask(__name__)
 CORS(app)
 
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
+PAYMENTS_PROFILE_ID = os.getenv("PAYMENTS_PROFILE_ID", "971027154283")
 
 def load_google_ads_client():
     """Load Google Ads client and derive MCC customer ID from config."""
@@ -39,11 +40,13 @@ def is_network_error(e):
 def index():
     return jsonify({
         "message": "Google Ads Backend API with Soft Cap Enforcement",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "endpoints": {
             "POST /create-account": "Create new client account (no auto-billing). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
             "GET /list-linked-accounts": "List all client accounts under MCC",
             "POST /assign-billing-setup": "Assign billing setup to existing account. Body: {customer_id}",
+            "GET /check-verification-status": "Check advertiser verification status. Query: ?customer_id=XXX",
+            "POST /start-verification": "Initiate advertiser verification. Body: {customer_id}",
             "POST /update-email": "Update dashboard email. Body: {customer_id, email}",
             "POST /approve-topup": "Approve topup: creates hard+soft cap. Body: {customer_id, topup_amount}",
             "POST /check-and-pause-campaigns": "Enforce soft cap (pause campaigns). Body: {customer_id}",
@@ -185,86 +188,15 @@ def list_linked_accounts():
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
 
-@app.route('/debug-billing-setup', methods=['GET'])
-def debug_billing_setup():
-    """
-    GET /debug-billing-setup
-    
-    Debug endpoint to show:
-    1. Account customer ID from config
-    2. All billing setups on this account with their IDs and status
-    3. What to use for BILLING_SETUP_ID environment variable
-    """
-    try:
-        client, mcc_customer_id = load_google_ads_client()
-        ga_service = client.get_service("GoogleAdsService")
-        
-        print(f"[DEBUG-BS] Account Customer ID: {mcc_customer_id}")
-        
-        # Query all billing setups
-        billing_query = """
-            SELECT
-                billing_setup.id,
-                billing_setup.resource_name,
-                billing_setup.status
-            FROM billing_setup
-        """
-        
-        try:
-            response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
-            
-            setups = []
-            for row in response:
-                bs = row.billing_setup
-                setups.append({
-                    "billing_setup_id": bs.id,
-                    "resource_name": bs.resource_name,
-                    "status": bs.status.name
-                })
-                print(f"[DEBUG-BS] Found: ID={bs.id}, Status={bs.status.name}, Resource={bs.resource_name}")
-            
-            if not setups:
-                print(f"[DEBUG-BS] No billing setups found on account {mcc_customer_id}")
-            
-            return jsonify({
-                "success": True,
-                "customer_id": mcc_customer_id,
-                "billing_setups_count": len(setups),
-                "billing_setups": setups,
-                "instruction": "Use one of the billing_setup_id values above as BILLING_SETUP_ID in Render environment variables",
-                "note": "Prefer billing setups with status = ACTIVE"
-            }), 200
-            
-        except GoogleAdsException as e:
-            print(f"[DEBUG-BS] GoogleAdsException: {str(e)}")
-            for error in e.failure.errors:
-                print(f"[DEBUG-BS] Error: {error.error_code.name} - {error.message}")
-            
-            return jsonify({
-                "success": False,
-                "customer_id": mcc_customer_id,
-                "error": str(e),
-                "error_details": [{"code": err.error_code.name, "message": err.message} for err in e.failure.errors]
-            }), 400
-            
-    except Exception as e:
-        print(f"[DEBUG-BS] Unexpected error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
-
-
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
     POST /assign-billing-setup
     
-    Links the MCC's Payments Profile to a client account via API.
-    Uses the correct resource name format for payments_profile_id.
+    Assigns billing setup to client account using payments profile ID.
+    Uses BillingSetupService to link the MCC's payments profile.
+    
+    Expected JSON: {customer_id: "1234567890"}
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -275,45 +207,22 @@ def assign_billing_setup():
     for attempt in range(3):
         try:
             client, mcc_customer_id = load_google_ads_client()
-            ga_service = client.get_service("GoogleAdsService")
             billing_setup_service = client.get_service("BillingSetupService")
 
             print(f"\n[ASSIGN-BILLING] Starting...")
             print(f"[ASSIGN-BILLING] MCC ID: {mcc_customer_id}")
             print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
+            print(f"[ASSIGN-BILLING] Payments Profile ID: {PAYMENTS_PROFILE_ID}")
 
-            # Step 1: Query the MCC's billing setups to get the correct resource
-            billing_query = """
-                SELECT
-                    billing_setup.resource_name,
-                    billing_setup.id,
-                    billing_setup.status
-                FROM billing_setup
-                WHERE billing_setup.status = APPROVED
-                LIMIT 1
-            """
-            billing_response = ga_service.search(customer_id=mcc_customer_id, query=billing_query)
-            
-            mcc_billing_setup_resource = None
-            for row in billing_response:
-                mcc_billing_setup_resource = row.billing_setup.resource_name
-                print(f"[ASSIGN-BILLING] Found MCC billing setup: {mcc_billing_setup_resource}")
-                break
-            
-            if not mcc_billing_setup_resource:
-                return jsonify({
-                    "success": False,
-                    "errors": ["No APPROVED billing setup found on MCC. Link manually first."]
-                }), 400
-
-            # Step 2: Create billing setup for child account using the MCC's resource
+            # Create billing setup operation using payments profile ID
             operation = client.get_type("BillingSetupOperation")
             billing_setup = operation.create
 
-            # THIS IS THE KEY FIX: Use the resource name directly, not payments_profile_id
-            billing_setup.billing_setup = mcc_billing_setup_resource
+            # Set payments profile ID (12 digits, no dashes)
+            billing_setup.payments_account_info.payments_profile_id = PAYMENTS_PROFILE_ID
+            billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
 
-            print(f"[ASSIGN-BILLING] Linking {mcc_billing_setup_resource} to {customer_id}...")
+            print(f"[ASSIGN-BILLING] Creating billing setup with payments profile {PAYMENTS_PROFILE_ID}...")
 
             response = billing_setup_service.mutate_billing_setup(
                 customer_id=customer_id,
@@ -326,11 +235,11 @@ def assign_billing_setup():
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
-                "mcc_billing_setup": mcc_billing_setup_resource,
+                "payments_profile_id": PAYMENTS_PROFILE_ID,
                 "new_billing_setup": new_resource,
                 "message": "✅ Successfully linked billing setup via API.",
                 "status": "PENDING",
-                "next_step": f"/approve-topup with customer_id={customer_id}",
+                "next_step": f"Verify account status, then call /start-verification",
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
@@ -338,10 +247,17 @@ def assign_billing_setup():
             error_msg = str(e)
             print(f"[ASSIGN-BILLING] GoogleAdsException: {error_msg}\n")
             
+            error_details = []
+            for error in e.failure.errors:
+                error_details.append(f"{error.error_code.name}: {error.message}")
+            
             if "BILLING_SETUP_ALREADY_EXISTS" in error_msg:
                 return jsonify({"success": False, "errors": ["Customer already has a billing setup."]}), 400
             
-            return jsonify({"success": False, "errors": [str(e)]}), 400
+            if "NO_SIGNUP_PERMISSION" in error_msg:
+                return jsonify({"success": False, "errors": ["Account does not have permission to signup for billing. Check account status."]}), 400
+            
+            return jsonify({"success": False, "errors": error_details}), 400
 
         except Exception as e:
             if is_network_error(e):
@@ -353,6 +269,156 @@ def assign_billing_setup():
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
+
+@app.route('/check-verification-status', methods=['GET'])
+def check_verification_status():
+    """
+    GET /check-verification-status?customer_id=XXXX
+    
+    Checks if a client account requires advertiser identity verification.
+    Prerequisites: Account must have active billing setup (NO_EFFECTIVE_BILLING error if not).
+    
+    Returns verification status, deadline, and requirements.
+    """
+    customer_id = request.args.get('customer_id', '').strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    for attempt in range(3):
+        try:
+            client, _ = load_google_ads_client()
+            iv_service = client.get_service("IdentityVerificationService")
+
+            print(f"\n[CHECK-VERIFICATION] Checking verification status for {customer_id}...")
+
+            response = iv_service.get_identity_verification(customer_id=customer_id)
+
+            if not response.identity_verification:
+                print(f"[CHECK-VERIFICATION] No verification required for {customer_id}")
+                return jsonify({
+                    "success": True,
+                    "customer_id": customer_id,
+                    "verification_required": False,
+                    "message": "No advertiser verification required for this account.",
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }), 200
+
+            iv = response.identity_verification[0]
+            
+            # Extract status
+            program_status = iv.verification_progress.program_status.name if iv.verification_progress else "UNKNOWN"
+            
+            # Extract deadline
+            deadline = iv.identity_verification_requirement.verification_completion_deadline_time if iv.identity_verification_requirement else "N/A"
+            
+            print(f"[CHECK-VERIFICATION] Status: {program_status}, Deadline: {deadline}")
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "verification_required": True,
+                "status": program_status,
+                "deadline": deadline,
+                "message": f"Verification required. Status: {program_status}. Deadline: {deadline}",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            error_msg = str(e)
+            print(f"[CHECK-VERIFICATION] GoogleAdsException: {error_msg}\n")
+            
+            if "NO_EFFECTIVE_BILLING" in error_msg:
+                return jsonify({
+                    "success": False,
+                    "errors": ["Account has no active billing setup. Call /assign-billing-setup first."]
+                }), 400
+            
+            error_details = [f"{err.error_code.name}: {err.message}" for err in e.failure.errors]
+            return jsonify({"success": False, "errors": error_details}), 400
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({"success": False, "errors": ["Network error. Try again."]}), 500
+            return jsonify({"success": False, "errors": [str(e)]}), 500
+
+    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+
+
+@app.route('/start-verification', methods=['POST'])
+def start_verification():
+    """
+    POST /start-verification
+    
+    Initiates the advertiser identity verification process for an account.
+    Prerequisites: Account must have active billing setup (NO_EFFECTIVE_BILLING error if not).
+    
+    After this, user must manually complete verification form in Google Ads UI.
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    for attempt in range(3):
+        try:
+            client, _ = load_google_ads_client()
+            iv_service = client.get_service("IdentityVerificationService")
+
+            print(f"\n[START-VERIFICATION] Initiating verification for {customer_id}...")
+
+            # Get the enum value for ADVERTISER_IDENTITY_VERIFICATION
+            verification_program = client.enums.IdentityVerificationProgramEnum.ADVERTISER_IDENTITY_VERIFICATION
+
+            iv_service.start_identity_verification(
+                customer_id=customer_id,
+                verification_program=verification_program
+            )
+
+            print(f"[START-VERIFICATION] Successfully initiated for {customer_id}\n")
+
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "message": "✅ Advertiser identity verification initiated.",
+                "next_step": "User must login to Google Ads and complete verification form in Billing > Advertiser verification section.",
+                "user_action_required": True,
+                "estimated_completion_time": "5-10 minutes for user to submit docs + 1-7 days for Google review",
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }), 200
+
+        except GoogleAdsException as e:
+            error_msg = str(e)
+            print(f"[START-VERIFICATION] GoogleAdsException: {error_msg}\n")
+            
+            if "NO_EFFECTIVE_BILLING" in error_msg:
+                return jsonify({
+                    "success": False,
+                    "errors": ["Account has no active billing setup. Call /assign-billing-setup first."]
+                }), 400
+            
+            if "ALREADY_STARTED" in error_msg or "ALREADY_VERIFIED" in error_msg:
+                return jsonify({
+                    "success": False,
+                    "errors": ["Verification already started or completed for this account."]
+                }), 400
+            
+            error_details = [f"{err.error_code.name}: {err.message}" for err in e.failure.errors]
+            return jsonify({"success": False, "errors": error_details}), 400
+
+        except Exception as e:
+            if is_network_error(e):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return jsonify({"success": False, "errors": ["Network error. Try again."]}), 500
+            return jsonify({"success": False, "errors": [str(e)]}), 500
+
+    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
 
 @app.route('/update-email', methods=['POST'])
