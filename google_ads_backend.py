@@ -13,6 +13,8 @@ CORS(app)
 
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 PAYMENTS_PROFILE_ID = os.getenv("PAYMENTS_PROFILE_ID", "971027154283")
+PAYMENTS_ACCOUNT_ID = os.getenv("PAYMENTS_ACCOUNT_ID", "8565-8516-5026-9885")
+
 
 def load_google_ads_client():
     """Load Google Ads client and derive MCC customer ID from config."""
