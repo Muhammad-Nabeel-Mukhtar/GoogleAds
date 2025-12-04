@@ -151,42 +151,33 @@ def create_account():
 
 @app.route('/list-linked-accounts', methods=['GET'])
 def list_linked_accounts():
-    """GET /list-linked-accounts - List all client accounts under MCC (excluding the MCC itself)."""
-    for attempt in range(3):
-        try:
-            client, mcc_customer_id = load_google_ads_client()
-            ga_service = client.get_service("GoogleAdsService")
+    # mcc_id comes from YAML (login_customer_id), not from query anymore
+    try:
+        client, mcc_id = load_google_ads_client()
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
-            # Ensure MCC is normalized (no dashes) for comparison
-            mcc_clean = str(mcc_customer_id).replace("-", "").strip()
-
-            query = f"""
-                SELECT
-                    customer.id,
-                    customer.descriptive_name,
-                    customer.status
-                FROM customer
-                WHERE customer.id != {mcc_clean}
-            """
-            response = ga_service.search(customer_id=mcc_clean, query=query)
-
-            accounts = []
-            for row in response:
-                accounts.append({
-                    "client_id": row.customer.id,
-                    "name": row.customer.descriptive_name,
-                    "status": row.customer.status.name
-                })
-
-            return jsonify({"success": True, "accounts": accounts, "errors": []}), 200
-        except Exception as e:
-            if is_network_error(e):
-                if attempt < 2:
-                    time.sleep(5)
-                    continue
-                return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
-            return jsonify({"success": False, "errors": [str(e)]}), 400
-    return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+    try:
+        ga_service = client.get_service("GoogleAdsService")
+        query = """
+            SELECT
+              customer_client.client_customer,
+              customer_client.descriptive_name,
+              customer_client.status
+            FROM customer_client
+            ORDER BY customer_client.descriptive_name
+        """
+        response = ga_service.search(customer_id=mcc_id, query=query)
+        results = []
+        for row in response:
+            results.append({
+                "client_id": row.customer_client.client_customer.split('/')[-1],
+                "name": row.customer_client.descriptive_name,
+                "status": row.customer_client.status.name
+            })
+        return jsonify({"success": True, "accounts": results, "errors": []}), 200
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
 
 @app.route('/assign-billing-setup', methods=['POST'])
