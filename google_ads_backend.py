@@ -154,6 +154,65 @@ def create_account():
     return jsonify({"success": False, "errors": ["Max network retries reached."], "accounts": []}), 500
 
 
+@app.route('/debug-assign-billing', methods=['POST'])
+def debug_assign_billing():
+    """Debug version of assign-billing-setup with full error details."""
+    import traceback
+    
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    try:
+        client, mcc_customer_id = load_google_ads_client()
+        billing_setup_service = client.get_service("BillingSetupService")
+
+        print(f"\n[DEBUG] MCC ID: {mcc_customer_id}")
+        print(f"[DEBUG] Client ID: {customer_id}")
+        print(f"[DEBUG] Payments Profile ID: {PAYMENTS_PROFILE_ID}")
+        print(f"[DEBUG] Payments Account ID: {PAYMENTS_ACCOUNT_ID}")
+
+        operation = client.get_type("BillingSetupOperation")
+        billing_setup = operation.create
+
+        billing_setup.payments_account_info.payments_account_id = PAYMENTS_ACCOUNT_ID
+        billing_setup.payments_account_info.payments_profile_id = PAYMENTS_PROFILE_ID
+        billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
+
+        print(f"[DEBUG] Created operation, calling API...")
+        print(f"[DEBUG] payments_account_id: {PAYMENTS_ACCOUNT_ID}")
+        print(f"[DEBUG] payments_profile_id: {PAYMENTS_PROFILE_ID}")
+
+        response = billing_setup_service.mutate_billing_setup(
+            customer_id=customer_id,
+            operation=operation
+        )
+
+        new_resource = response.result.resource_name
+        print(f"[DEBUG] SUCCESS: {new_resource}")
+
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "payments_account_id": PAYMENTS_ACCOUNT_ID,
+            "payments_profile_id": PAYMENTS_PROFILE_ID,
+            "new_billing_setup": new_resource,
+            "message": "✅ Successfully linked billing setup via API."
+        }), 200
+
+    except Exception as e:
+        print(f"[DEBUG] FULL ERROR:\n{traceback.format_exc()}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+
 @app.route('/debug-billing-from-mcc', methods=['GET'])
 def debug_billing_from_mcc():
     """
