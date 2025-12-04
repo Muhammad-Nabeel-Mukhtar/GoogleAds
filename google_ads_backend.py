@@ -11,6 +11,7 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
+
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 PAYMENTS_PROFILE_ID = os.getenv("PAYMENTS_PROFILE_ID", "971027154283")
 PAYMENTS_ACCOUNT_ID = os.getenv("PAYMENTS_ACCOUNT_ID", "8565-8516-5026-9885")
@@ -323,10 +324,10 @@ def list_linked_accounts():
 def assign_billing_setup():
     """
     POST /assign-billing-setup
-    
-    Assigns billing setup to client account using payments account ID and profile ID.
-    Uses BillingSetupService to link the MCC's payments profile and account.
-    
+
+    Assigns billing setup to client account using an existing payments account ID.
+    Uses BillingSetupService to link the MCC's payments account to the child account.
+
     Expected JSON: {customer_id: "1234567890"}
     """
     data = request.json or {}
@@ -343,19 +344,23 @@ def assign_billing_setup():
             print(f"\n[ASSIGN-BILLING] Starting...")
             print(f"[ASSIGN-BILLING] MCC ID: {mcc_customer_id}")
             print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
-            print(f"[ASSIGN-BILLING] Payments Profile ID: {PAYMENTS_PROFILE_ID}")
             print(f"[ASSIGN-BILLING] Payments Account ID: {PAYMENTS_ACCOUNT_ID}")
+            print(f"[ASSIGN-BILLING] Payments Profile ID (unused here): {PAYMENTS_PROFILE_ID}")
 
-            # Create billing setup operation using payments account ID and profile ID
+            # Build payments account resource name, as per docs:
+            # ResourceNames.payments_account(customer_id, payments_account_id)
+            payments_account_resource = (
+                f"customers/{mcc_customer_id}/paymentsAccounts/{PAYMENTS_ACCOUNT_ID}"
+            )
+
             operation = client.get_type("BillingSetupOperation")
             billing_setup = operation.create
 
-            # Set both payments account ID (with dashes) and payments profile ID (no dashes)
-            billing_setup.payments_account_info.payments_account_id = PAYMENTS_ACCOUNT_ID
-            billing_setup.payments_account_info.payments_profile_id = PAYMENTS_PROFILE_ID
+            # Important: use payments_account, not payments_account_info
+            billing_setup.payments_account = payments_account_resource
             billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
 
-            print(f"[ASSIGN-BILLING] Creating billing setup with account {PAYMENTS_ACCOUNT_ID} and profile {PAYMENTS_PROFILE_ID}...")
+            print(f"[ASSIGN-BILLING] Creating billing setup with payments_account={payments_account_resource}...")
 
             response = billing_setup_service.mutate_billing_setup(
                 customer_id=customer_id,
@@ -368,8 +373,8 @@ def assign_billing_setup():
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
+                "payments_account_resource": payments_account_resource,
                 "payments_account_id": PAYMENTS_ACCOUNT_ID,
-                "payments_profile_id": PAYMENTS_PROFILE_ID,
                 "new_billing_setup": new_resource,
                 "message": "✅ Successfully linked billing setup via API.",
                 "status": "PENDING",
@@ -380,17 +385,17 @@ def assign_billing_setup():
         except GoogleAdsException as e:
             error_msg = str(e)
             print(f"[ASSIGN-BILLING] GoogleAdsException: {error_msg}\n")
-            
+
             error_details = []
             for error in e.failure.errors:
                 error_details.append(f"{error.error_code.name}: {error.message}")
-            
+
             if "BILLING_SETUP_ALREADY_EXISTS" in error_msg:
                 return jsonify({"success": False, "errors": ["Customer already has a billing setup."]}), 400
-            
+
             if "NO_SIGNUP_PERMISSION" in error_msg:
                 return jsonify({"success": False, "errors": ["Account does not have permission to signup for billing. Check account status."]}), 400
-            
+
             return jsonify({"success": False, "errors": error_details}), 400
 
         except Exception as e:
@@ -402,6 +407,7 @@ def assign_billing_setup():
             return jsonify({"success": False, "errors": [str(e)]}), 500
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+
 
 
 @app.route('/check-verification-status', methods=['GET'])
