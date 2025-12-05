@@ -180,140 +180,133 @@ def list_linked_accounts():
         return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
 
+
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
     POST /assign-billing-setup
-
-    Assigns billing setup to an existing client account using official Google Ads API pattern.
-    Links the MCC's payments account to the child account.
-
+    
+    Assigns billing setup to a client account using official Google Ads API pattern.
+    Links the MCC's payments profile to the child account.
+    
     Expected JSON:
     {
         "customer_id": "1234567890"
     }
+    
+    Uses Payments Profile ID from environment (e.g., 9710-2715-4283)
+    NOT the Billing Setup ID (e.g., 8565-8516-5026-9885)
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
 
     if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    # Read payments PROFILE ID from environment (9710-2715-4283, not billing setup ID)
+    payments_profile_id = os.getenv("PAYMENTS_ACCOUNT_ID")
+    if not payments_profile_id:
+        return jsonify({"success": False, "errors": ["PAYMENTS_ACCOUNT_ID (Payments Profile ID) not configured in environment."]}), 500
+
+    try:
+        client, mcc_customer_id = load_google_ads_client()
+        billing_setup_service = client.get_service("BillingSetupService")
+
+        # Clean MCC ID (remove dashes)
+        mcc_clean = str(mcc_customer_id).replace("-", "").strip()
+
+        print(f"\n[ASSIGN-BILLING] Starting...")
+        print(f"[ASSIGN-BILLING] MCC ID (clean): {mcc_clean}")
+        print(f"[ASSIGN-BILLING] Child Account ID: {customer_id}")
+        print(f"[ASSIGN-BILLING] Payments Profile ID: {payments_profile_id}")
+
+        # Build resource name for payments account (OFFICIAL PATTERN)
+        # Format: customers/{mcc_id}/paymentsAccounts/{payments_profile_id}
+        # NOTE: Use Payments Profile ID, NOT Billing Setup ID
+        payments_account_resource = f"customers/{mcc_clean}/paymentsAccounts/{payments_profile_id}"
+        
+        print(f"[ASSIGN-BILLING] Payments Account Resource: {payments_account_resource}")
+
+        # Create billing setup operation
+        operation = client.get_type("BillingSetupOperation")
+        billing_setup = operation.create
+        
+        # CRITICAL: Use payments_account field with the resource name
+        billing_setup.payments_account = payments_account_resource
+        billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d")
+
+        print(f"[ASSIGN-BILLING] Calling BillingSetupService.mutate_billing_setup...")
+
+        response = billing_setup_service.mutate_billing_setup(
+            customer_id=customer_id,
+            operation=operation
+        )
+
+        new_resource = response.result.resource_name
+        
+        print(f"[ASSIGN-BILLING] SUCCESS: {new_resource}\n")
+
         return jsonify({
-            "success": False,
-            "errors": ["Valid numeric customer_id is required."]
-        }), 400
+            "success": True,
+            "customer_id": customer_id,
+            "mcc_id": mcc_clean,
+            "payments_profile_id": payments_profile_id,
+            "new_billing_setup": new_resource,
+            "message": "✅ Billing setup assigned successfully.",
+            "status": "PENDING",
+            "next_step": "Call /approve-topup to set spending limits",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200
 
-    # Read payments account ID from environment
-    payments_account_id = os.getenv("PAYMENTS_ACCOUNT_ID")
-    if not payments_account_id:
-        return jsonify({
-            "success": False,
-            "errors": ["PAYMENTS_ACCOUNT_ID not configured in environment."]
-        }), 500
+    except GoogleAdsException as e:
+        error_details = []
+        for error in e.failure.errors:
+            error_code = error.error_code.name if hasattr(error.error_code, 'name') else str(error.error_code)
+            error_details.append(f"{error_code}: {error.message}")
+        
+        print(f"[ASSIGN-BILLING] GoogleAdsException: {error_details}\n")
 
-    for attempt in range(3):
-        try:
-            client, mcc_customer_id = load_google_ads_client()
-            billing_setup_service = client.get_service("BillingSetupService")
-
-            # Normalize MCC ID (10 digits, no dashes)
-            mcc_clean = str(mcc_customer_id).replace("-", "").strip()
-
-            print(f"\n[ASSIGN-BILLING] Starting...")
-            print(f"[ASSIGN-BILLING] Client ID: {customer_id}")
-            print(f"[ASSIGN-BILLING] MCC ID (clean): {mcc_clean}")
-            print(f"[ASSIGN-BILLING] Payments Account ID: {payments_account_id}")
-
-            # Build resource name for payments account (OFFICIAL PATTERN)
-            # Format: customers/{mcc_id}/paymentsAccounts/{payments_account_id}
-            payments_account_resource = f"customers/{mcc_clean}/paymentsAccounts/{payments_account_id}"
-            print(f"[ASSIGN-BILLING] Resource: {payments_account_resource}")
-
-            # Create billing setup operation
-            operation = client.get_type("BillingSetupOperation")
-            billing_setup = operation.create
-
-            # CRITICAL: Use payments_account (NOT payments_account_info)
-            billing_setup.payments_account = payments_account_resource
-            billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d")
-
-            print(f"[ASSIGN-BILLING] Calling BillingSetupService.mutate_billing_setup...")
-
-            response = billing_setup_service.mutate_billing_setup(
-                customer_id=customer_id,
-                operation=operation
-            )
-
-            new_resource = response.result.resource_name
-            print(f"[ASSIGN-BILLING] SUCCESS: {new_resource}\n")
-
-            return jsonify({
-                "success": True,
-                "customer_id": customer_id,
-                "mcc_customer_id": mcc_clean,
-                "payments_account_id": payments_account_id,
-                "new_billing_setup": new_resource,
-                "message": "✅ Billing setup assigned successfully.",
-                "status": "PENDING",
-                "next_step": "Call /approve-topup to set spending limits",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }), 200
-
-        except GoogleAdsException as e:
-            error_details = []
-            for error in e.failure.errors:
-                error_code = error.error_code.name if hasattr(error.error_code, 'name') else str(error.error_code)
-                error_details.append(f"{error_code}: {error.message}")
-
-            print(f"[ASSIGN-BILLING] GoogleAdsException: {error_details}\n")
-
-            if any("BILLING_SETUP_ALREADY_EXISTS" in str(err) for err in e.failure.errors):
-                return jsonify({
-                    "success": False,
-                    "errors": ["Account already has a billing setup."]
-                }), 400
-
-            if any("INVALID_PAYMENTS_ACCOUNT" in str(err) for err in e.failure.errors):
-                return jsonify({
-                    "success": False,
-                    "errors": [
-                        "Invalid payments account for this MCC.",
-                        "Verify in Google Ads Dashboard that this payments account is active and allowed for this region."
-                    ]
-                }), 400
-
-            if any("NO_SIGNUP_PERMISSION" in str(err) for err in e.failure.errors):
-                return jsonify({
-                    "success": False,
-                    "errors": ["Account does not have permission to setup billing. Check account status."]
-                }), 400
-
+        # Handle specific errors
+        if any("BILLING_SETUP_ALREADY_EXISTS" in str(err) for err in e.failure.errors):
             return jsonify({
                 "success": False,
-                "errors": error_details
+                "errors": ["Account already has a billing setup."]
             }), 400
 
-        except Exception as e:
-            print(f"[ASSIGN-BILLING] Exception: {str(e)}\n")
-
-            if is_network_error(e):
-                if attempt < 2:
-                    print(f"[ASSIGN-BILLING] Retrying... ({attempt + 1}/3)")
-                    time.sleep(5)
-                    continue
-                return jsonify({
-                    "success": False,
-                    "errors": ["Network error. Please try again.", str(e)]
-                }), 500
-
+        if any("INVALID_PAYMENTS_ACCOUNT" in str(err) for err in e.failure.errors):
             return jsonify({
                 "success": False,
-                "errors": [str(e)]
-            }), 500
+                "errors": [
+                    "Invalid payments account/profile for this MCC.",
+                    f"Ensure PAYMENTS_ACCOUNT_ID ({payments_profile_id}) is the correct Payments Profile ID.",
+                    "Verify in Google Ads Dashboard that this payments profile is active and linked to the MCC."
+                ]
+            }), 400
 
-    return jsonify({
-        "success": False,
-        "errors": ["Max retries reached."]
-    }), 500
+        if any("NO_SIGNUP_PERMISSION" in str(err) for err in e.failure.errors):
+            return jsonify({
+                "success": False,
+                "errors": ["Account does not have permission for manager billing. Check account status."]
+            }), 400
+
+        return jsonify({
+            "success": False,
+            "errors": error_details
+        }), 400
+
+    except Exception as e:
+        print(f"[ASSIGN-BILLING] Exception: {str(e)}\n")
+        
+        if is_network_error(e):
+            return jsonify({
+                "success": False,
+                "errors": ["Network error. Please try again.", str(e)]
+            }), 500
+        
+        return jsonify({
+            "success": False,
+            "errors": [str(e)]
+        }), 500
 
 
 @app.route('/update-email', methods=['POST'])
