@@ -180,115 +180,82 @@ def list_linked_accounts():
         return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
 
-
-
-@app.route('/check-billing-eligibility', methods=['GET'])
-def check_billing_eligibility():
+@app.route('/test-billing-service', methods=['POST'])
+def test_billing_service():
     """
-    GET /check-billing-eligibility
+    POST /test-billing-service
     
-    Check if MCC account has billing setup capability and what setups exist.
-    Helps diagnose why API billing assignment fails while UI works.
+    Directly test BillingSetupService to see what Google returns.
     """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+    payments_profile_id = data.get('payments_profile_id', '9710-2715-4283')
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
     try:
         client, mcc_id = load_google_ads_client()
-        ga_service = client.get_service("GoogleAdsService")
+        billing_setup_service = client.get_service("BillingSetupService")
         mcc_clean = str(mcc_id).replace("-", "").strip()
 
-        print(f"\n[CHECK-BILLING] Checking MCC: {mcc_clean}")
+        print(f"\n[TEST-BILLING] Direct BillingSetupService Test")
+        print(f"[TEST-BILLING] MCC: {mcc_clean}")
+        print(f"[TEST-BILLING] Child: {customer_id}")
+        print(f"[TEST-BILLING] Payments Profile: {payments_profile_id}")
 
-        # Query 1: Check billing setups on MCC itself
-        billing_query = """
-            SELECT
-                billing_setup.id,
-                billing_setup.resource_name,
-                billing_setup.status,
-                billing_setup.payments_account
-            FROM billing_setup
-        """
-        
-        print(f"[CHECK-BILLING] Querying billing setups for MCC...")
-        try:
-            billing_response = ga_service.search(customer_id=mcc_clean, query=billing_query)
-            billing_setups = []
-            for row in billing_response:
-                bs = row.billing_setup
-                billing_setups.append({
-                    "id": bs.id,
-                    "status": bs.status.name,
-                    "payments_account": bs.payments_account,
-                    "resource_name": bs.resource_name
-                })
-                print(f"[CHECK-BILLING] Found: {bs.id} - Status: {bs.status.name}")
-        except Exception as e:
-            billing_setups = []
-            print(f"[CHECK-BILLING] Error querying billing_setup: {str(e)}")
+        # Build resource
+        payments_account_resource = f"customers/{mcc_clean}/paymentsAccounts/{payments_profile_id}"
+        print(f"[TEST-BILLING] Resource: {payments_account_resource}")
 
-        # Query 2: Check account access (do we have proper permissions?)
-        access_query = """
-            SELECT
-                customer.id,
-                customer.descriptive_name,
-                customer.manager,
-                customer.test_account
-            FROM customer
-            LIMIT 1
-        """
-        
-        print(f"[CHECK-BILLING] Checking account access...")
-        try:
-            access_response = ga_service.search(customer_id=mcc_clean, query=access_query)
-            account_info = None
-            for row in access_response:
-                account_info = {
-                    "id": row.customer.id,
-                    "name": row.customer.descriptive_name,
-                    "is_manager": row.customer.manager,
-                    "is_test": row.customer.test_account
-                }
-                print(f"[CHECK-BILLING] Account: {account_info['id']} - Manager: {account_info['is_manager']}")
-        except Exception as e:
-            account_info = None
-            print(f"[CHECK-BILLING] Error checking account: {str(e)}")
+        # Create operation
+        operation = client.get_type("BillingSetupOperation")
+        billing_setup = operation.create
+        billing_setup.payments_account = payments_account_resource
+        billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d")
 
-        # Query 3: Check payments profiles accessible
-        payments_query = """
-            SELECT
-                payments_account.payments_account_id,
-                payments_account.name,
-                payments_account.currency_code
-            FROM payments_account
-        """
-        
-        print(f"[CHECK-BILLING] Checking payments accounts...")
-        try:
-            payments_response = ga_service.search(customer_id=mcc_clean, query=payments_query)
-            payments_accounts = []
-            for row in payments_response:
-                pa = row.payments_account
-                payments_accounts.append({
-                    "id": pa.payments_account_id,
-                    "name": pa.name,
-                    "currency": pa.currency_code
-                })
-                print(f"[CHECK-BILLING] Found: {pa.payments_account_id} - {pa.name}")
-        except Exception as e:
-            payments_accounts = []
-            print(f"[CHECK-BILLING] Error querying payments_account: {str(e)}")
+        print(f"[TEST-BILLING] Attempting mutate_billing_setup...")
+        print(f"[TEST-BILLING] Operation type: {type(operation)}")
+        print(f"[TEST-BILLING] Billing setup: {billing_setup}")
+
+        # Try the call
+        response = billing_setup_service.mutate_billing_setup(
+            customer_id=customer_id,
+            operation=operation
+        )
 
         return jsonify({
             "success": True,
-            "mcc_id": mcc_clean,
-            "account_info": account_info,
-            "billing_setups": billing_setups,
-            "payments_accounts": payments_accounts,
-            "message": "Eligibility check complete. See details below.",
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "response": str(response),
+            "message": "BillingSetupService call succeeded!"
         }), 200
 
+    except GoogleAdsException as e:
+        errors = []
+        for err in e.failure.errors:
+            error_code = err.error_code.name if hasattr(err.error_code, 'name') else str(err.error_code)
+            errors.append({
+                "code": error_code,
+                "message": err.message,
+                "trigger": getattr(err, 'trigger', 'N/A')
+            })
+        
+        print(f"[TEST-BILLING] GoogleAdsException: {errors}")
+        
+        return jsonify({
+            "success": False,
+            "error_type": "GoogleAdsException",
+            "errors": errors,
+            "diagnosis": "If INVALID_CUSTOMER_ID: Payments profile not accessible. If PERMISSION_DENIED: OAuth scope missing."
+        }), 400
+
     except Exception as e:
-        print(f"[CHECK-BILLING] EXCEPTION: {str(e)}")
-        return jsonify({"success": False, "errors": [str(e)]}), 500
+        print(f"[TEST-BILLING] Exception: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error_type": type(e).__name__,
+            "error": str(e)
+        }), 500
 
 
 
