@@ -443,10 +443,6 @@ def test_billing_service():
         }), 500
 
 
-# ============================================================================
-# ENDPOINT 4: ASSIGN BILLING SETUP
-# ============================================================================
-
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
@@ -519,7 +515,7 @@ def assign_billing_setup():
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-        billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
+        # FIX: Don't set start_date_time at all - let Google handle the timing
 
         print("[BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
