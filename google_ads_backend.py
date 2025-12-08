@@ -7,6 +7,13 @@ import socket
 import re
 import os
 from datetime import datetime
+import logging
+import sys
+
+logger = logging.getLogger('google.ads.googleads.client')
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.setLevel(logging.DEBUG)  # or INFO
+
 
 app = Flask(__name__)
 CORS(app)
