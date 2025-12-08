@@ -127,10 +127,10 @@ def debug_get_payments_accounts():
 def check_billing_eligibility():
     """
     POST /check-billing-eligibility
-    
-    Checks if a customer has an active payments account linked.
-    Useful for debugging billing setup issues.
-    
+
+    Checks if a customer has any billing setups and returns their payments_account
+    resource names (if present).
+
     Expected JSON:
     {
         "customer_id": "1234567890"
@@ -149,7 +149,7 @@ def check_billing_eligibility():
         print(f"\n[CHECK-BILLING] Starting...")
         print(f"[CHECK-BILLING] Customer ID: {customer_id}")
 
-        # Query 1: Check if customer is a manager
+        # Query 1: basic customer info (is_manager flag)
         query_manager = f"""
             SELECT
               customer.id,
@@ -159,15 +159,15 @@ def check_billing_eligibility():
             WHERE customer.id = '{customer_id}'
         """
 
-        print(f"[CHECK-BILLING] Query 1: Checking if customer is manager...")
+        print("[CHECK-BILLING] Query 1: Checking if customer is manager...")
         response_manager = ga_service.search(customer_id=customer_id, query=query_manager)
-        
+
         is_manager = False
         for row in response_manager:
             is_manager = row.customer.manager
             print(f"[CHECK-BILLING] is_manager: {is_manager}")
 
-        # Query 2: Get all billing setups
+        # Query 2: list billing setups and their payments_account
         query_billing = """
             SELECT
               billing_setup.resource_name,
@@ -178,10 +178,12 @@ def check_billing_eligibility():
             FROM billing_setup
         """
 
-        print(f"[CHECK-BILLING] Query 2: Getting billing setups...")
+        print("[CHECK-BILLING] Query 2: Getting billing setups...")
         response_billing = ga_service.search(customer_id=customer_id, query=query_billing)
 
         billing_setups = []
+        payments_accounts = set()
+
         for row in response_billing:
             bs = row.billing_setup
             setup = {
@@ -189,37 +191,16 @@ def check_billing_eligibility():
                 "payments_account": bs.payments_account,
                 "status": bs.status.name,
                 "start_date": bs.start_date_time,
-                "end_date": bs.end_date_time
+                "end_date": bs.end_date_time,
             }
             billing_setups.append(setup)
+            if bs.payments_account:
+                payments_accounts.add(bs.payments_account)
             print(f"[CHECK-BILLING] Billing Setup: {setup}")
 
-        # Query 3: Get all payments accounts
-        query_payments = """
-            SELECT
-              payments_account.payments_account_id,
-              payments_account.name,
-              payments_account.currency_code,
-              payments_account.pay_per_click_only
-            FROM payments_account
-        """
+        payments_accounts_list = list(payments_accounts)
 
-        print(f"[CHECK-BILLING] Query 3: Getting payments accounts...")
-        response_payments = ga_service.search(customer_id=customer_id, query=query_payments)
-
-        payments_accounts = []
-        for row in response_payments:
-            pa = row.payments_account
-            account = {
-                "payments_account_id": pa.payments_account_id,
-                "name": pa.name,
-                "currency_code": pa.currency_code,
-                "pay_per_click_only": pa.pay_per_click_only
-            }
-            payments_accounts.append(account)
-            print(f"[CHECK-BILLING] Payments Account: {account}")
-
-        print(f"[CHECK-BILLING] SUCCESS!\n")
+        print("[CHECK-BILLING] SUCCESS!\n")
 
         return jsonify({
             "success": True,
@@ -227,9 +208,9 @@ def check_billing_eligibility():
             "is_manager": is_manager,
             "billing_setups_count": len(billing_setups),
             "billing_setups": billing_setups,
-            "payments_accounts_count": len(payments_accounts),
-            "payments_accounts": payments_accounts,
-            "message": f"Found {len(billing_setups)} billing setups and {len(payments_accounts)} payments accounts.",
+            "payments_accounts": payments_accounts_list,
+            "payments_accounts_count": len(payments_accounts_list),
+            "message": f"Found {len(billing_setups)} billing setups and {len(payments_accounts_list)} distinct payments_account resource names.",
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
 
