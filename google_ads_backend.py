@@ -51,6 +51,206 @@ def index():
         }
     })
 
+
+# ============================================================================
+# DEBUG ENDPOINT: GET PAYMENTS ACCOUNTS
+# ============================================================================
+
+@app.route('/debug-get-payments-accounts', methods=['GET'])
+def debug_get_payments_accounts():
+    """
+    GET /debug-get-payments-accounts
+    
+    Query: ?customer_id=XXXX
+    
+    Retrieves all payments accounts linked to a customer (for debugging).
+    """
+    customer_id = request.args.get('customer_id', '').strip()
+    
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+    
+    try:
+        client, mcc_id = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+        
+        print(f"\n[DEBUG] Getting payments accounts for customer: {customer_id}")
+        
+        query = """
+            SELECT
+              billing_setup.payments_account,
+              billing_setup.status,
+              billing_setup.start_date_time,
+              billing_setup.end_date_time
+            FROM billing_setup
+            ORDER BY billing_setup.creation_date_time DESC
+        """
+        
+        print(f"[DEBUG] Query: {query}")
+        response = ga_service.search(customer_id=customer_id, query=query)
+        
+        results = []
+        for row in response:
+            bs = row.billing_setup
+            result = {
+                "payments_account": bs.payments_account,
+                "status": bs.status.name,
+                "start_date": bs.start_date_time,
+                "end_date": bs.end_date_time
+            }
+            results.append(result)
+            print(f"[DEBUG] Found: {result}")
+        
+        print(f"[DEBUG] SUCCESS! Found {len(results)} billing setups\n")
+        
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "billing_setups_count": len(results),
+            "billing_setups": results,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200
+    
+    except GoogleAdsException as e:
+        error_details = [f"{err.error_code.name}: {err.message}" for err in e.failure.errors]
+        print(f"[DEBUG] ERROR: {error_details}")
+        return jsonify({"success": False, "errors": error_details}), 400
+    
+    except Exception as e:
+        print(f"[DEBUG] EXCEPTION: {str(e)}")
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+# ============================================================================
+# ENDPOINT: CHECK BILLING ELIGIBILITY (DEBUG)
+# ============================================================================
+
+@app.route('/check-billing-eligibility', methods=['POST'])
+def check_billing_eligibility():
+    """
+    POST /check-billing-eligibility
+    
+    Checks if a customer has an active payments account linked.
+    Useful for debugging billing setup issues.
+    
+    Expected JSON:
+    {
+        "customer_id": "1234567890"
+    }
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    try:
+        client, mcc_id = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        print(f"\n[CHECK-BILLING] Starting...")
+        print(f"[CHECK-BILLING] Customer ID: {customer_id}")
+
+        # Query 1: Check if customer is a manager
+        query_manager = f"""
+            SELECT
+              customer.id,
+              customer.manager,
+              customer.test_account
+            FROM customer
+            WHERE customer.id = '{customer_id}'
+        """
+
+        print(f"[CHECK-BILLING] Query 1: Checking if customer is manager...")
+        response_manager = ga_service.search(customer_id=customer_id, query=query_manager)
+        
+        is_manager = False
+        for row in response_manager:
+            is_manager = row.customer.manager
+            print(f"[CHECK-BILLING] is_manager: {is_manager}")
+
+        # Query 2: Get all billing setups
+        query_billing = """
+            SELECT
+              billing_setup.resource_name,
+              billing_setup.payments_account,
+              billing_setup.status,
+              billing_setup.start_date_time,
+              billing_setup.end_date_time
+            FROM billing_setup
+            ORDER BY billing_setup.creation_date_time DESC
+        """
+
+        print(f"[CHECK-BILLING] Query 2: Getting billing setups...")
+        response_billing = ga_service.search(customer_id=customer_id, query=query_billing)
+
+        billing_setups = []
+        for row in response_billing:
+            bs = row.billing_setup
+            setup = {
+                "resource_name": bs.resource_name,
+                "payments_account": bs.payments_account,
+                "status": bs.status.name,
+                "start_date": bs.start_date_time,
+                "end_date": bs.end_date_time
+            }
+            billing_setups.append(setup)
+            print(f"[CHECK-BILLING] Billing Setup: {setup}")
+
+        # Query 3: Get all payments accounts
+        query_payments = """
+            SELECT
+              payments_account.payments_account_id,
+              payments_account.name,
+              payments_account.currency_code,
+              payments_account.pay_per_click_only,
+              payments_account.primary_billing_id,
+              payments_account.secondary_billing_id,
+              payments_account.tertiary_billing_id
+            FROM payments_account
+        """
+
+        print(f"[CHECK-BILLING] Query 3: Getting payments accounts...")
+        response_payments = ga_service.search(customer_id=customer_id, query=query_payments)
+
+        payments_accounts = []
+        for row in response_payments:
+            pa = row.payments_account
+            account = {
+                "payments_account_id": pa.payments_account_id,
+                "name": pa.name,
+                "currency_code": pa.currency_code,
+                "pay_per_click_only": pa.pay_per_click_only,
+                "primary_billing_id": pa.primary_billing_id,
+                "secondary_billing_id": pa.secondary_billing_id,
+                "tertiary_billing_id": pa.tertiary_billing_id
+            }
+            payments_accounts.append(account)
+            print(f"[CHECK-BILLING] Payments Account: {account}")
+
+        print(f"[CHECK-BILLING] SUCCESS!\n")
+
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "is_manager": is_manager,
+            "billing_setups_count": len(billing_setups),
+            "billing_setups": billing_setups,
+            "payments_accounts_count": len(payments_accounts),
+            "payments_accounts": payments_accounts,
+            "message": f"Found {len(billing_setups)} billing setups and {len(payments_accounts)} payments accounts.",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200
+
+    except GoogleAdsException as e:
+        error_details = [f"{err.error_code.name}: {err.message}" for err in e.failure.errors]
+        print(f"[CHECK-BILLING] ERROR: {error_details}")
+        return jsonify({"success": False, "errors": error_details}), 400
+
+    except Exception as e:
+        print(f"[CHECK-BILLING] EXCEPTION: {str(e)}")
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
 @app.route('/create-account', methods=['POST'])
 def create_account():
     """
