@@ -119,7 +119,6 @@ def debug_get_payments_accounts():
     except Exception as e:
         print(f"[DEBUG] EXCEPTION: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
 # ============================================================================
 # ENDPOINT: CHECK BILLING ELIGIBILITY (DEBUG)
 # ============================================================================
@@ -177,7 +176,6 @@ def check_billing_eligibility():
               billing_setup.start_date_time,
               billing_setup.end_date_time
             FROM billing_setup
-            ORDER BY billing_setup.creation_date_time DESC
         """
 
         print(f"[CHECK-BILLING] Query 2: Getting billing setups...")
@@ -202,10 +200,7 @@ def check_billing_eligibility():
               payments_account.payments_account_id,
               payments_account.name,
               payments_account.currency_code,
-              payments_account.pay_per_click_only,
-              payments_account.primary_billing_id,
-              payments_account.secondary_billing_id,
-              payments_account.tertiary_billing_id
+              payments_account.pay_per_click_only
             FROM payments_account
         """
 
@@ -219,10 +214,7 @@ def check_billing_eligibility():
                 "payments_account_id": pa.payments_account_id,
                 "name": pa.name,
                 "currency_code": pa.currency_code,
-                "pay_per_click_only": pa.pay_per_click_only,
-                "primary_billing_id": pa.primary_billing_id,
-                "secondary_billing_id": pa.secondary_billing_id,
-                "tertiary_billing_id": pa.tertiary_billing_id
+                "pay_per_click_only": pa.pay_per_click_only
             }
             payments_accounts.append(account)
             print(f"[CHECK-BILLING] Payments Account: {account}")
@@ -242,7 +234,12 @@ def check_billing_eligibility():
         }), 200
 
     except GoogleAdsException as e:
-        error_details = [f"{err.error_code.name}: {err.message}" for err in e.failure.errors]
+        error_details = []
+        for err in e.failure.errors:
+            error_details.append({
+                "error_code": str(err.error_code),
+                "message": err.message
+            })
         print(f"[CHECK-BILLING] ERROR: {error_details}")
         return jsonify({"success": False, "errors": error_details}), 400
 
