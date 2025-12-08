@@ -442,7 +442,6 @@ def test_billing_service():
             "error": str(e)
         }), 500
 
-
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
@@ -486,6 +485,8 @@ def assign_billing_setup():
         """
         print("[BILLING] Checking existing billing setups for this customer...")
         existing_using_same = False
+        detected_payments_account = None
+
         for row in ga_service.search(customer_id=customer_id, query=check_query):
             bs = row.billing_setup
             print(f"[BILLING] Existing billing_setup: {bs.resource_name}, "
@@ -496,7 +497,6 @@ def assign_billing_setup():
                 break
 
         if existing_using_same:
-            # Idempotent behavior: already assigned
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
@@ -511,11 +511,11 @@ def assign_billing_setup():
         payments_account_resource = f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
         print(f"[BILLING] Using payments_account resource: {payments_account_resource}")
 
-        # 3) Create billing setup operation
+        # 3) Create billing setup operation with required start_time
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-        # FIX: Don't set start_date_time at all - let Google handle the timing
+        billing_setup.start_time = datetime.utcnow().strftime('%Y-%m-%d')
 
         print("[BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
@@ -570,7 +570,6 @@ def assign_billing_setup():
     except Exception as e:
         print(f"[BILLING] EXCEPTION: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
 
 @app.route('/update-email', methods=['POST'])
 def update_email():
