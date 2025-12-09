@@ -597,7 +597,7 @@ def assign_billing_setup():
 
         # 2) Build the payments_account resource name using the MCC (paying manager)
         payments_account_resource = (
-            f"customers/{mcc_clean}/paymentsAccounts/{payments_account_id}"
+            f"customers/4655362660/paymentsAccounts/{payments_account_id}"
         )
         print(f"[BILLING] Using payments_account resource: {payments_account_resource}")
 
