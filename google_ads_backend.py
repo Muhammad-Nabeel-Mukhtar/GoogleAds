@@ -554,8 +554,11 @@ def assign_billing_setup():
         billing_setup_service = client.get_service("BillingSetupService")
         ga_service = client.get_service("GoogleAdsService")
 
+        mcc_clean = str(mcc_customer_id).replace("-", "").strip()
+
         print("\n[BILLING] Starting...")
         print(f"[BILLING] MCC ID: {mcc_customer_id}")
+        print(f"[BILLING] MCC (clean): {mcc_clean}")
         print(f"[BILLING] Client ID: {customer_id}")
         print(f"[BILLING] Payments Account ID (env): {payments_account_id}")
 
@@ -569,6 +572,8 @@ def assign_billing_setup():
         """
         print("[BILLING] Checking existing billing setups for this customer...")
         existing_using_same = False
+        detected_payments_account = None
+
         for row in ga_service.search(customer_id=customer_id, query=check_query):
             bs = row.billing_setup
             print(f"[BILLING] Existing billing_setup: {bs.resource_name}, "
@@ -590,15 +595,19 @@ def assign_billing_setup():
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
-        # 2) Build the payments_account resource name for this child account
-        payments_account_resource = f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
+        # 2) Build the payments_account resource name using the MCC (paying manager)
+        payments_account_resource = (
+            f"customers/{mcc_clean}/paymentsAccounts/{payments_account_id}"
+        )
         print(f"[BILLING] Using payments_account resource: {payments_account_resource}")
 
         # 3) Create billing setup operation
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-        billing_setup.start_date_time = datetime.utcnow().strftime('%Y-%m-%d')
+
+        # Let Google determine the start date; do NOT set start_date_time manually
+        # unless Google support explicitly instructs otherwise.
 
         print("[BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
@@ -615,7 +624,7 @@ def assign_billing_setup():
             "mcc_id": mcc_customer_id,
             "payments_account_resource": payments_account_resource,
             "new_billing_setup": new_resource,
-            "message": "✅ Billing setup assigned successfully via API.",
+            "message": "Billing setup request sent successfully via API.",
             "status": "PENDING",
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
@@ -653,6 +662,7 @@ def assign_billing_setup():
     except Exception as e:
         print(f"[BILLING] EXCEPTION: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
+
 
 
 @app.route('/update-email', methods=['POST'])
