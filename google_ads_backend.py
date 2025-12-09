@@ -645,9 +645,9 @@ def update_email():
 def approve_topup():
     """
     POST /approve-topup
-    
+
     Stores top-up as soft cap in DB and attempts to set hard cap via AccountBudgetProposal.
-    
+
     Expected JSON:
     {
         "customer_id": "1234567890",
@@ -674,7 +674,8 @@ def approve_topup():
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
 
-    spending_limit_micros = int(topup_amount * 1_000_000)
+    # Topup in micros (this is the increment we want to add)
+    topup_micros = int(topup_amount * 1_000_000)
 
     for attempt in range(3):
         try:
@@ -719,7 +720,7 @@ def approve_topup():
                     existing_budget = row.account_budget
                     print(f"[DEBUG] Found EXISTING account_budget: id={existing_budget.id}")
                     break
-                
+
                 if existing_budget is None:
                     print(f"[DEBUG] No existing account_budget for {customer_id}. Will CREATE new one.")
             except Exception as e:
@@ -729,6 +730,7 @@ def approve_topup():
             hard_cap_status = "NOT_ATTEMPTED"
             account_budget_proposal_resource = None
             proposal_id = None
+            new_spending_limit_micros = None
 
             operation = client.get_type("AccountBudgetProposalOperation")
             proposal = operation.create
@@ -739,15 +741,26 @@ def approve_topup():
             proposal_type_name = None
 
             if existing_budget:
+                # ACCUMULATE: take current limit and add topup
+                current_limit = existing_budget.proposed_spending_limit_micros or existing_budget.approved_spending_limit_micros
+                if current_limit is None or current_limit == 0:
+                    new_spending_limit_micros = topup_micros
+                else:
+                    new_spending_limit_micros = current_limit + topup_micros
+
                 proposal.proposal_type = proposal_type_enum.UPDATE
                 proposal.account_budget = existing_budget.resource_name
-                proposal.proposed_spending_limit_micros = spending_limit_micros
-                proposal.proposed_notes = f"Updated via /approve-topup. Limit: {topup_amount} {customer_currency}."
+                proposal.proposed_spending_limit_micros = new_spending_limit_micros
+                proposal.proposed_notes = (
+                    f"Updated via /approve-topup. "
+                    f"Increment: {topup_amount} {customer_currency}. "
+                    f"New limit: {new_spending_limit_micros / 1e6:.2f} {customer_currency}."
+                )
                 operation.update_mask.paths.append("proposed_spending_limit_micros")
                 operation.update_mask.paths.append("proposed_notes")
                 proposal_type_name = "UPDATE"
             else:
-                # CREATE new budget
+                # CREATE new budget with topup as initial limit
                 billing_query = """
                     SELECT
                         billing_setup.id,
@@ -767,16 +780,20 @@ def approve_topup():
                         break
 
                 if billing_setup_resource:
+                    new_spending_limit_micros = topup_micros
                     proposal.proposal_type = proposal_type_enum.CREATE
                     proposal.billing_setup = billing_setup_resource
-                    proposal.proposed_spending_limit_micros = spending_limit_micros
+                    proposal.proposed_spending_limit_micros = new_spending_limit_micros
                     proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
-                    proposal.proposed_notes = f"Created via /approve-topup. Limit: {topup_amount} {customer_currency}."
+                    proposal.proposed_notes = (
+                        f"Created via /approve-topup. "
+                        f"Initial limit: {topup_amount} {customer_currency}."
+                    )
                     proposal.proposed_start_time_type = time_type_enum.NOW
                     proposal.proposed_end_time_type = time_type_enum.FOREVER
                     proposal_type_name = "CREATE"
 
-            if proposal_type_name:
+            if proposal_type_name and new_spending_limit_micros is not None:
                 try:
                     response = proposal_service.mutate_account_budget_proposal(
                         customer_id=customer_id,
@@ -797,12 +814,17 @@ def approve_topup():
                 "customer_id": customer_id,
                 "topup_amount": topup_amount,
                 "currency": customer_currency,
-                "spending_limit_micros": spending_limit_micros,
+                "topup_micros": topup_micros,
+                "new_spending_limit_micros": new_spending_limit_micros,
+                "new_spending_limit": (new_spending_limit_micros / 1e6) if new_spending_limit_micros else None,
                 "hard_cap_status": hard_cap_status,
                 "hard_cap_proposal_id": proposal_id,
                 "soft_cap_status": soft_cap_status,
                 "account_budget_proposal_resource": account_budget_proposal_resource,
-                "message": f"Topup of {topup_amount} {customer_currency} approved. Hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}.",
+                "message": (
+                    f"Topup of {topup_amount} {customer_currency} approved. "
+                    f"New hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}."
+                ),
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
@@ -812,7 +834,7 @@ def approve_topup():
                     time.sleep(5)
                     continue
                 return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
-            return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}) , 500
+            return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}), 500
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
 
@@ -904,6 +926,7 @@ def client_spend_status():
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
 
+            # 1) Fetch spend metrics
             metrics_query = """
                 SELECT
                     customer.currency_code,
@@ -919,11 +942,29 @@ def client_spend_status():
                 currency = row.customer.currency_code
                 break
 
-            # TODO: Fetch from MongoDB
-            topup_balance_micros = 10_000_000
+            # 2) Fetch current account budget limit (hard cap)
+            budget_query = """
+                SELECT
+                    account_budget.approved_spending_limit_micros,
+                    account_budget.proposed_spending_limit_micros
+                FROM account_budget
+                ORDER BY account_budget.id DESC
+                LIMIT 1
+            """
+            topup_balance_micros = 0
+            budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
+            for row in budget_response:
+                approved = row.account_budget.approved_spending_limit_micros
+                proposed = row.account_budget.proposed_spending_limit_micros
+                topup_balance_micros = proposed or approved or 0
+                break
 
+            # If no budget found, treat as zero balance
             remaining_balance_micros = max(0, topup_balance_micros - total_spend_micros)
-            percentage_used = (total_spend_micros / topup_balance_micros * 100) if topup_balance_micros > 0 else 0
+            percentage_used = (
+                (total_spend_micros / topup_balance_micros * 100)
+                if topup_balance_micros > 0 else 0
+            )
 
             return jsonify({
                 "success": True,
@@ -946,7 +987,9 @@ def client_spend_status():
                     continue
                 return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
             return jsonify({"success": False, "errors": [str(e)]}), 400
+
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=False)
