@@ -365,82 +365,161 @@ def list_linked_accounts():
         return jsonify({"success": False, "errors": [str(e)], "accounts": []}), 500
 
 
-@app.route('/test-billing-service', methods=['POST'])
-def test_billing_service():
+@app.route('/debug-account-health', methods=['GET'])
+def debug_account_health():
     """
-    POST /test-billing-service
-    
-    Directly test BillingSetupService to see what Google returns.
+    GET /debug-account-health?customer_id=XXXX
+
+    Returns a consolidated view of a customer's state:
+    - Basic customer info (currency, manager flag, test account)
+    - Billing setups and payments accounts
+    - Account budgets (limits and status)
+    - Current total spend (metrics.cost_micros)
     """
-    data = request.json or {}
-    customer_id = str(data.get('customer_id', '')).strip()
-    payments_profile_id = data.get('payments_profile_id', '9710-2715-4283')
+    customer_id = request.args.get('customer_id', '').strip()
 
     if not customer_id or not customer_id.isdigit():
         return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
 
     try:
         client, mcc_id = load_google_ads_client()
-        billing_setup_service = client.get_service("BillingSetupService")
-        mcc_clean = str(mcc_id).replace("-", "").strip()
+        ga_service = client.get_service("GoogleAdsService")
 
-        print(f"\n[TEST-BILLING] Direct BillingSetupService Test")
-        print(f"[TEST-BILLING] MCC: {mcc_clean}")
-        print(f"[TEST-BILLING] Child: {customer_id}")
-        print(f"[TEST-BILLING] Payments Profile: {payments_profile_id}")
+        print(f"\n[DEBUG-HEALTH] Starting for customer: {customer_id}")
+        print(f"[DEBUG-HEALTH] MCC: {mcc_id}")
 
-        # Build resource
-        payments_account_resource = f"customers/{mcc_clean}/paymentsAccounts/{payments_profile_id}"
-        print(f"[TEST-BILLING] Resource: {payments_account_resource}")
+        # 1) Customer info
+        customer_info = {}
+        query_customer = f"""
+            SELECT
+              customer.id,
+              customer.descriptive_name,
+              customer.currency_code,
+              customer.time_zone,
+              customer.manager,
+              customer.test_account
+            FROM customer
+            WHERE customer.id = '{customer_id}'
+        """
+        print("[DEBUG-HEALTH] Query customer info...")
+        resp_customer = ga_service.search(customer_id=customer_id, query=query_customer)
+        for row in resp_customer:
+            c = row.customer
+            customer_info = {
+                "id": c.id,
+                "name": c.descriptive_name,
+                "currency_code": c.currency_code,
+                "time_zone": c.time_zone,
+                "is_manager": c.manager,
+                "is_test_account": c.test_account,
+            }
+            break
 
-        # Create operation
-        operation = client.get_type("BillingSetupOperation")
-        billing_setup = operation.create
-        billing_setup.payments_account = payments_account_resource
-        billing_setup.start_date_time = datetime.utcnow().strftime("%Y-%m-%d")
+        # 2) Billing setups
+        billing_setups = []
+        payments_accounts_set = set()
+        query_billing = """
+            SELECT
+              billing_setup.resource_name,
+              billing_setup.payments_account,
+              billing_setup.status,
+              billing_setup.start_date_time,
+              billing_setup.end_date_time
+            FROM billing_setup
+        """
+        print("[DEBUG-HEALTH] Query billing setups...")
+        resp_billing = ga_service.search(customer_id=customer_id, query=query_billing)
+        for row in resp_billing:
+            bs = row.billing_setup
+            setup = {
+                "resource_name": bs.resource_name,
+                "payments_account": bs.payments_account,
+                "status": bs.status.name,
+                "start_date": bs.start_date_time,
+                "end_date": bs.end_date_time,
+            }
+            billing_setups.append(setup)
+            if bs.payments_account:
+                payments_accounts_set.add(bs.payments_account)
 
-        print(f"[TEST-BILLING] Attempting mutate_billing_setup...")
-        print(f"[TEST-BILLING] Operation type: {type(operation)}")
-        print(f"[TEST-BILLING] Billing setup: {billing_setup}")
+        # 3) Account budgets
+        account_budgets = []
+        query_budget = """
+            SELECT
+              account_budget.id,
+              account_budget.resource_name,
+              account_budget.status,
+              account_budget.approved_spending_limit_micros,
+              account_budget.proposed_spending_limit_micros,
+              account_budget.approved_start_date_time,
+              account_budget.approved_end_date_time
+            FROM account_budget
+            ORDER BY account_budget.id
+        """
+        print("[DEBUG-HEALTH] Query account budgets...")
+        resp_budget = ga_service.search(customer_id=customer_id, query=query_budget)
+        for row in resp_budget:
+            ab = row.account_budget
+            budget = {
+                "id": ab.id,
+                "resource_name": ab.resource_name,
+                "status": ab.status.name,
+                "approved_spending_limit_micros": ab.approved_spending_limit_micros,
+                "proposed_spending_limit_micros": ab.proposed_spending_limit_micros,
+                "approved_start_date_time": ab.approved_start_date_time,
+                "approved_end_date_time": ab.approved_end_date_time,
+            }
+            account_budgets.append(budget)
 
-        # Try the call
-        response = billing_setup_service.mutate_billing_setup(
-            customer_id=customer_id,
-            operation=operation
-        )
+        # 4) Current spend
+        metrics_query = """
+            SELECT
+                customer.currency_code,
+                metrics.cost_micros
+            FROM customer
+        """
+        print("[DEBUG-HEALTH] Query current spend...")
+        metrics_resp = ga_service.search(customer_id=customer_id, query=metrics_query)
+
+        total_spend_micros = 0
+        currency = customer_info.get("currency_code", "USD")
+        for row in metrics_resp:
+            total_spend_micros = row.metrics.cost_micros
+            currency = row.customer.currency_code
+            break
+
+        print("[DEBUG-HEALTH] SUCCESS\n")
 
         return jsonify({
             "success": True,
-            "response": str(response),
-            "message": "BillingSetupService call succeeded!"
+            "customer_id": customer_id,
+            "mcc_id": mcc_id,
+            "customer_info": customer_info,
+            "billing_setups_count": len(billing_setups),
+            "billing_setups": billing_setups,
+            "payments_accounts": list(payments_accounts_set),
+            "payments_accounts_count": len(payments_accounts_set),
+            "account_budgets_count": len(account_budgets),
+            "account_budgets": account_budgets,
+            "total_spend": total_spend_micros / 1e6,
+            "total_spend_micros": total_spend_micros,
+            "currency": currency,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
 
     except GoogleAdsException as e:
-        errors = []
+        error_details = []
         for err in e.failure.errors:
-            error_code = err.error_code.name if hasattr(err.error_code, 'name') else str(err.error_code)
-            errors.append({
-                "code": error_code,
-                "message": err.message,
-                "trigger": getattr(err, 'trigger', 'N/A')
+            error_details.append({
+                "error_code": str(err.error_code),
+                "message": err.message
             })
-        
-        print(f"[TEST-BILLING] GoogleAdsException: {errors}")
-        
-        return jsonify({
-            "success": False,
-            "error_type": "GoogleAdsException",
-            "errors": errors,
-            "diagnosis": "If INVALID_CUSTOMER_ID: Payments profile not accessible. If PERMISSION_DENIED: OAuth scope missing."
-        }), 400
+        print(f"[DEBUG-HEALTH] GoogleAdsException: {error_details}")
+        return jsonify({"success": False, "errors": error_details}), 400
 
     except Exception as e:
-        print(f"[TEST-BILLING] Exception: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error_type": type(e).__name__,
-            "error": str(e)
-        }), 500
+        print(f"[DEBUG-HEALTH] EXCEPTION: {str(e)}")
+        return jsonify({"success": False, "errors": [str(e)]}), 500
 
 
 # ============================================================================
