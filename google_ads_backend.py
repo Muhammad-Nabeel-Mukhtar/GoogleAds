@@ -48,13 +48,36 @@ def index():
         "message": "Google Ads Backend API with Soft Cap Enforcement",
         "version": "2.0.0",
         "endpoints": {
-            "POST /create-account": "Create new client account (no auto-billing). Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}",
-            "GET /list-linked-accounts": "List all client accounts under MCC",
-            "POST /assign-billing-setup": "Assign billing setup to existing account. Body: {customer_id}",
-            "POST /update-email": "Update dashboard email. Body: {customer_id, email}",
-            "POST /approve-topup": "Approve topup: creates hard+soft cap. Body: {customer_id, topup_amount}",
-            "POST /check-and-pause-campaigns": "Enforce soft cap (pause campaigns). Body: {customer_id}",
-            "GET /client-spend-status": "Get spend/balance status. Query: ?customer_id=XXX"
+            "POST /create-account": (
+                "Create a new client account under the MCC (no automatic billing assignment). "
+                "Body: {name, currency, timezone, email, [tracking_url], [final_url_suffix]}"
+            ),
+            "GET /list-linked-accounts": (
+                "List all client accounts currently linked under the MCC."
+            ),
+            "POST /assign-billing-setup": (
+                "Assign the MCC payments account as billing for an existing client account "
+                "using Google Ads BillingSetupService. Body: {customer_id}"
+            ),
+            "POST /update-email": (
+                "Update the dashboard/notification email stored for a given client account. "
+                "Body: {customer_id, email}"
+            ),
+            "POST /approve-topup": (
+                "Approve a topup and create an account budget (hard cap + soft cap) for the client. "
+                "Uses Google Ads AccountBudgetProposalService. "
+                "Body: {customer_id, topup_amount}"
+            ),
+            "POST /check-and-pause-campaigns": (
+                "Check current spend against the configured soft cap and pause all active campaigns "
+                "for the client if the soft cap is reached/exceeded. Body: {customer_id}"
+            ),
+            "GET /client-spend-status": (
+                "Get spend and balance status for a client account (based on Google Ads reporting "
+                "and the last approved topup in our DB). "
+                "Query: ?customer_id=XXX. "
+                "Returns: {topup_amount, total_spend, remaining_balance, percentage_used}"
+            )
         }
     })
 
