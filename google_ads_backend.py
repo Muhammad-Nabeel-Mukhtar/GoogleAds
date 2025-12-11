@@ -87,6 +87,38 @@ from flask import jsonify
 
 
 
+@app.route('/list-payments-accounts', methods=['GET'])
+def list_payments_accounts():
+    """Diagnostic: list payments accounts visible to this MCC via API."""
+    client: GoogleAdsClient = get_google_ads_client()  # uses google-ads.yaml
+
+    # Use the same login_customer_id (MCC) already configured in google-ads.yaml
+    mcc_id = str(client.login_customer_id)
+
+    service = client.get_service("PaymentsAccountService")
+    request = client.get_type("ListPaymentsAccountsRequest")
+    request.customer_id = mcc_id  # MCC ID without dashes [web:691]
+
+    response = service.list_payments_accounts(request=request)
+
+    results = []
+    for pa in response.payments_accounts:
+        results.append({
+            "resource_name": pa.resource_name,
+            "payments_account_id": pa.payments_account_id,
+            "payments_account_name": pa.payments_account_name,
+            "payments_profile_id": pa.payments_profile_id,
+            "paying_manager_customer": pa.paying_manager_customer,
+        })
+
+    return jsonify({
+        "mcc_id": mcc_id,
+        "count": len(results),
+        "payments_accounts": results,
+    })
+
+
+
 # ============================================================================
 # DEBUG ENDPOINT: GET PAYMENTS ACCOUNTS
 # ============================================================================
@@ -157,37 +189,6 @@ def debug_get_payments_accounts():
 # ============================================================================
 # ENDPOINT: CHECK BILLING ELIGIBILITY (DEBUG)
 # ============================================================================
-
-@app.route('/list-payments-accounts', methods=['GET'])
-def list_payments_accounts():
-    """Diagnostic: list payments accounts visible to this MCC via API."""
-    # Uses the same google-ads.yaml and login_customer_id as the rest of your app
-    client: GoogleAdsClient = get_google_ads_client()
-
-    # The login_customer_id in google-ads.yaml is your MCC; use that for this request
-    mcc_id = str(client.login_customer_id)
-
-    service = client.get_service("PaymentsAccountService")
-    request = client.get_type("ListPaymentsAccountsRequest")
-    request.customer_id = mcc_id  # must be MCC ID without dashes [web:693][web:696]
-
-    response = service.list_payments_accounts(request=request)
-
-    results = []
-    for pa in response.payments_accounts:
-        results.append({
-            "resource_name": pa.resource_name,
-            "payments_account_id": pa.payments_account_id,
-            "payments_account_name": pa.payments_account_name,
-            "payments_profile_id": pa.payments_profile_id,
-            "paying_manager_customer": pa.paying_manager_customer,
-        })
-
-    return jsonify({
-        "mcc_id": mcc_id,
-        "count": len(results),
-        "payments_accounts": results,
-    })
 
 
 @app.route('/check-billing-eligibility', methods=['POST'])
