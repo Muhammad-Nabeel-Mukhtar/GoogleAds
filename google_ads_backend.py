@@ -721,6 +721,8 @@ def debug_account_health():
 # ENDPOINT 4: ASSIGN BILLING SETUP
 # ============================================================================
 
+from datetime import datetime, timedelta
+
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
@@ -733,11 +735,6 @@ def assign_billing_setup():
     {
         "customer_id": "1234567890"
     }
-
-    Handles three cases:
-    1. No billing setup exists → Create new one
-    2. Billing setup exists with same payments account → Return success (idempotent)
-    3. Billing setup exists but dangling (no payments account) → Delete and recreate
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -749,6 +746,13 @@ def assign_billing_setup():
     if not payments_account_id:
         return jsonify({"success": False, "errors": ["PAYMENTS_ACCOUNT_ID not configured in environment."]}), 500
 
+    # Basic format check: xxxx-xxxx-xxxx-xxxx
+    if not all(c.isdigit() or c == '-' for c in payments_account_id) or payments_account_id.count('-') != 3:
+        return jsonify({
+            "success": False,
+            "errors": [f"Payments account ID must be in format xxxx-xxxx-xxxx-xxxx. Got: {payments_account_id}"]
+        }), 400
+
     try:
         client, mcc_id = load_google_ads_client()
         billing_setup_service = client.get_service("BillingSetupService")
@@ -759,14 +763,9 @@ def assign_billing_setup():
         print(f"[BILLING] Target Customer ID: {customer_id}")
         print(f"[BILLING] Payments Account ID (env): {payments_account_id}")
 
-        # Validate payments_account_id format
-        if not all(c.isdigit() or c == '-' for c in payments_account_id) or payments_account_id.count('-') != 3:
-            return jsonify({
-                "success": False,
-                "errors": [f"Payments account ID must be in format xxxx-xxxx-xxxx-xxxx. Got: {payments_account_id}"]
-            }), 400
-
-        # 1) Check existing billing setups
+        # ---------------------------------------------------------------------
+        # 1) Check existing billing setups (any status)
+        # ---------------------------------------------------------------------
         check_query = """
             SELECT
               billing_setup.resource_name,
@@ -787,12 +786,12 @@ def assign_billing_setup():
             print(f"[BILLING] Found: {existing_billing_setup}")
             print(f"         Status: {existing_status}")
             print(f"         Payments Account: {existing_payments_account if existing_payments_account else '(NONE - DANGLING)'}")
-            break
+            break  # only consider the first
 
-        # 2) Handle existing billing setup cases
+        # Handle existing setup cases
         if existing_billing_setup:
             if existing_payments_account and payments_account_id in existing_payments_account:
-                # Case 2: Proper setup already exists with correct payments account
+                # Already correctly linked to this payments account
                 print("[BILLING] Billing setup already correct (idempotent).")
                 return jsonify({
                     "success": True,
@@ -807,26 +806,24 @@ def assign_billing_setup():
                 }), 200
 
             elif not existing_payments_account:
-                # Case 3: Dangling setup (no payments account linked)
-                print("[BILLING] Dangling billing setup detected (no payments account).")
-                print("[BILLING] Attempting to delete old setup and create new one...")
+                # Dangling / cancelled setup with no payments account; remove then recreate
+                print("[BILLING] Dangling or cancelled billing setup detected (no payments account).")
+                print("[BILLING] Attempting to delete old setup...")
 
                 try:
-                    # Delete the dangling setup
-                    delete_operation = client.get_type("BillingSetupOperation")
-                    delete_operation.remove = existing_billing_setup
-                    print(f"[BILLING] Removing dangling setup: {existing_billing_setup}")
+                    delete_op = client.get_type("BillingSetupOperation")
+                    delete_op.remove = existing_billing_setup
                     billing_setup_service.mutate_billing_setup(
                         customer_id=customer_id,
-                        operation=delete_operation
+                        operation=delete_op
                     )
                     print("[BILLING] Dangling setup removed successfully.")
                 except Exception as e:
                     print(f"[BILLING] Warning: Could not remove dangling setup: {str(e)}")
-                    # Continue anyway - try to create new setup
+                    # Continue and try to create a new one anyway
 
             else:
-                # Case 4: Different payments account already linked (cannot change)
+                # A different payments account is already linked; do not override via API
                 print(f"[BILLING] Different payments account already assigned: {existing_payments_account}")
                 return jsonify({
                     "success": False,
@@ -840,13 +837,58 @@ def assign_billing_setup():
                     ]
                 }), 400
 
-        # 3) Create or recreate billing setup with correct payments account
+        # ---------------------------------------------------------------------
+        # 2) Build payments_account resource for THIS customer
+        # ---------------------------------------------------------------------
         payments_account_resource = f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
         print(f"[BILLING] Creating new billing setup with: {payments_account_resource}")
 
-        operation = client.get_type("BillingSetupOperation")
-        billing_setup = operation.create
+        # ---------------------------------------------------------------------
+        # 3) Set start_date_time and end_date_time as per official sample
+        # ---------------------------------------------------------------------
+        billing_setup = client.get_type("BillingSetup")
         billing_setup.payments_account = payments_account_resource
+
+        # Look for latest APPROVED billing setup to set dates correctly
+        approve_query = """
+            SELECT
+              billing_setup.end_date_time
+            FROM billing_setup
+            WHERE billing_setup.status = APPROVED
+            ORDER BY billing_setup.end_date_time DESC
+            LIMIT 1
+        """
+        print("[BILLING] Checking for existing APPROVED billing setups to set start/end dates...")
+        last_ending_date_time = None
+
+        approve_resp = ga_service.search(customer_id=customer_id, query=approve_query)
+        for row in approve_resp:
+            last_ending_date_time = row.billing_setup.end_date_time
+            print(f"[BILLING] Last approved billing_setup end_date_time: {last_ending_date_time}")
+            break
+
+        if last_ending_date_time:
+            # Parse end_date_time which may be "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+            try:
+                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d")
+            except ValueError:
+                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d %H:%M:%S")
+            start_date = end_dt + timedelta(days=1)
+        else:
+            # No approved setups: start today
+            start_date = datetime.utcnow()
+
+        billing_setup.start_date_time = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        billing_setup.end_date_time = (start_date + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[BILLING] start_date_time: {billing_setup.start_date_time}")
+        print(f"[BILLING] end_date_time:   {billing_setup.end_date_time}")
+
+        # ---------------------------------------------------------------------
+        # 4) Call mutate_billing_setup
+        # ---------------------------------------------------------------------
+        operation = client.get_type("BillingSetupOperation")
+        operation.create.CopyFrom(billing_setup)
 
         print("[BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
@@ -864,13 +906,8 @@ def assign_billing_setup():
             "payments_account_id": payments_account_id,
             "payments_account_resource": payments_account_resource,
             "new_billing_setup": new_resource,
-            "message": "Billing setup created successfully. Status is PENDING approval.",
+            "message": "Billing setup created successfully via API. Status will be PENDING until approved.",
             "status": "PENDING",
-            "next_steps": [
-                "The billing setup is now PENDING Google review (typically 24-48 hours).",
-                "Once APPROVED, you can use /approve-topup to create hard caps.",
-                "Check /debug-account-health to monitor billing setup status."
-            ],
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 201
 
@@ -891,8 +928,8 @@ def assign_billing_setup():
             "mcc_id": mcc_id,
             "errors": error_details,
             "recommendation": (
-                "If card/self-serve account, use /approve-topup + /check-and-pause-campaigns "
-                "for logical soft cap enforcement instead."
+                "If this is a card/self-serve account or billing is restricted, use "
+                "/approve-topup + /check-and-pause-campaigns for logical soft caps instead."
             )
         }), 400
 
@@ -903,7 +940,6 @@ def assign_billing_setup():
             "customer_id": customer_id,
             "errors": [str(e)],
         }), 500
-
 
 
 
