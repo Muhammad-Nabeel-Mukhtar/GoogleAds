@@ -85,19 +85,27 @@ def index():
 @app.route('/list-payments-accounts', methods=['GET'])
 def list_payments_accounts():
     """
-    GET /list-payments-accounts
+    GET /list-payments-accounts?customer_id=XXXX
 
-    Diagnostic: list payments accounts visible to this MCC via the API.
-    Uses login_customer_id from google-ads.yaml (via load_google_ads_client).
+    Diagnostic: list payments accounts available to a *serving* customer
+    as seen via the current MCC login_customer_id.
     """
+    serving_cid = request.args.get('customer_id', '').strip()
+
+    if not serving_cid or not serving_cid.isdigit():
+        return jsonify({
+            "success": False,
+            "errors": ["Valid numeric customer_id (serving account) is required."],
+        }), 400
+
     try:
-        client, mcc_id = load_google_ads_client()  # mcc_id is already cleaned (no dashes)
+        client, mcc_id = load_google_ads_client()  # mcc_id is the manager login_customer_id (cleaned)
 
         service = client.get_service("PaymentsAccountService")
-        request = client.get_type("ListPaymentsAccountsRequest")
-        request.customer_id = mcc_id  # must be numeric string without dashes [web:10]
+        request_proto = client.get_type("ListPaymentsAccountsRequest")
+        request_proto.customer_id = serving_cid  # must be a non-manager (serving) account [web:41]
 
-        response = service.list_payments_accounts(request=request)
+        response = service.list_payments_accounts(request=request_proto)
 
         results = []
         for pa in response.payments_accounts:
@@ -111,7 +119,8 @@ def list_payments_accounts():
 
         return jsonify({
             "success": True,
-            "mcc_id": mcc_id,
+            "mcc_login_customer_id": mcc_id,
+            "serving_customer_id": serving_cid,
             "count": len(results),
             "payments_accounts": results,
             "timestamp": datetime.utcnow().isoformat() + "Z"
