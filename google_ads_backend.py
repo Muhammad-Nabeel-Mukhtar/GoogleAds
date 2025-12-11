@@ -90,14 +90,15 @@ from flask import jsonify
 @app.route('/list-payments-accounts', methods=['GET'])
 def list_payments_accounts():
     """Diagnostic: list payments accounts visible to this MCC via API."""
-    client: GoogleAdsClient = get_google_ads_client()  # uses google-ads.yaml
+    # Use the same loader you use everywhere else
+    client: GoogleAdsClient = load_google_ads_client()
 
-    # Use the same login_customer_id (MCC) already configured in google-ads.yaml
+    # login_customer_id in google-ads.yaml is your MCC; library exposes it here
     mcc_id = str(client.login_customer_id)
 
     service = client.get_service("PaymentsAccountService")
     request = client.get_type("ListPaymentsAccountsRequest")
-    request.customer_id = mcc_id  # MCC ID without dashes [web:691]
+    request.customer_id = mcc_id
 
     response = service.list_payments_accounts(request=request)
 
