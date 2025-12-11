@@ -81,9 +81,52 @@ def index():
         }
     })
 
+@app.route('/list-payments-accounts', methods=['GET'])
+def list_payments_accounts():
+    """
+    GET /list-payments-accounts
 
-from google.ads.googleads.client import GoogleAdsClient
-from flask import jsonify
+    Diagnostic: list payments accounts visible to this MCC via the API.
+    Uses login_customer_id from google-ads.yaml (via load_google_ads_client).
+    """
+    try:
+        client, mcc_id = load_google_ads_client()  # mcc_id is already cleaned (no dashes)
+
+        service = client.get_service("PaymentsAccountService")
+        request = client.get_type("ListPaymentsAccountsRequest")
+        request.customer_id = mcc_id  # must be numeric string without dashes [web:10]
+
+        response = service.list_payments_accounts(request=request)
+
+        results = []
+        for pa in response.payments_accounts:
+            results.append({
+                "resource_name": pa.resource_name,
+                "payments_account_id": pa.payments_account_id,
+                "payments_account_name": pa.payments_account_name,
+                "payments_profile_id": pa.payments_profile_id,
+                "paying_manager_customer": pa.paying_manager_customer,
+            })
+
+        return jsonify({
+            "success": True,
+            "mcc_id": mcc_id,
+            "count": len(results),
+            "payments_accounts": results,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }), 200
+
+    except GoogleAdsException as e:
+        error_details = []
+        for err in e.failure.errors:
+            error_details.append({
+                "error_code": str(err.error_code),
+                "message": err.message
+            })
+        return jsonify({"success": False, "errors": error_details}), 400
+
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)]}), 500
 
 
 
