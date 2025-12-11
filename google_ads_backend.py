@@ -841,7 +841,7 @@ def assign_billing_setup():
                 }), 400
 
         # 3) Create or recreate billing setup with correct payments account
-        payments_account_resource = f"customers/{mcc_id}/paymentsAccounts/{payments_account_id}"
+        payments_account_resource = f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
         print(f"[BILLING] Creating new billing setup with: {payments_account_resource}")
 
         operation = client.get_type("BillingSetupOperation")
