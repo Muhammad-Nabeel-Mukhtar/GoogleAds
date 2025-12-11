@@ -87,8 +87,12 @@ def list_payments_accounts():
     """
     GET /list-payments-accounts?customer_id=XXXX
 
-    Diagnostic: list payments accounts available to a *serving* customer
-    as seen via the current MCC login_customer_id.
+    Lists payments accounts visible to a *serving* customer
+    from the current MCC's login_customer_id.
+    
+    Only serving (non-manager) accounts can call PaymentsAccountService.
+    The payments account's paying_manager_customer field tells you
+    if the account is under your manager hierarchy.
     """
     serving_cid = request.args.get('customer_id', '').strip()
 
@@ -99,11 +103,11 @@ def list_payments_accounts():
         }), 400
 
     try:
-        client, mcc_id = load_google_ads_client()  # mcc_id is the manager login_customer_id (cleaned)
+        client, mcc_id = load_google_ads_client()
 
         service = client.get_service("PaymentsAccountService")
         request_proto = client.get_type("ListPaymentsAccountsRequest")
-        request_proto.customer_id = serving_cid  # must be a non-manager (serving) account [web:41]
+        request_proto.customer_id = serving_cid  # must be serving account, not manager
 
         response = service.list_payments_accounts(request=request_proto)
 
@@ -112,7 +116,6 @@ def list_payments_accounts():
             results.append({
                 "resource_name": pa.resource_name,
                 "payments_account_id": pa.payments_account_id,
-                "payments_account_name": pa.payments_account_name,
                 "payments_profile_id": pa.payments_profile_id,
                 "paying_manager_customer": pa.paying_manager_customer,
             })
@@ -137,7 +140,6 @@ def list_payments_accounts():
 
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
 
 # ============================================================================
 # DEBUG ENDPOINT: GET PAYMENTS ACCOUNTS
