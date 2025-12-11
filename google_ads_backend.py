@@ -150,16 +150,8 @@ def check_manager_billing_accounts():
     Checks if the MCC (login_customer_id) has any payments accounts
     that can be used for programmatic billing of child customers.
     
-    Logic:
-    1. List all payments accounts visible to a serving customer
-    2. Filter those where paying_manager_customer == mcc_id
-    3. Return true if any exist
-    
-    According to Google Ads API docs:
-    - Programmatic billing (BillingSetup API) requires:
-      a) A payments account linked to your manager
-      b) The account to be invoice-eligible (not self-serve/card)
-      c) The payments account's paying_manager_customer to match your MCC
+    A payments account is "usable" if its paying_manager_customer 
+    matches the MCC's customer ID.
     """
     serving_cid = request.args.get('serving_customer_id', '').strip()
 
@@ -197,10 +189,19 @@ def check_manager_billing_accounts():
             }
             all_payments_accounts.append(account)
 
-            # Check if this account's paying_manager_customer matches the MCC
-            if pa.paying_manager_customer and str(pa.paying_manager_customer).replace("-", "").strip() == mcc_id:
-                manager_payments_accounts.append(account)
-                print(f"[CHECK-MANAGER-BILLING] Found manager payment account: {pa.payments_account_id}")
+            # Extract numeric customer ID from resource name
+            # paying_manager_customer format: "customers/1331285009"
+            if pa.paying_manager_customer:
+                manager_cid = pa.paying_manager_customer.split('/')[-1]
+                print(f"[CHECK-MANAGER-BILLING] Checking payment account {pa.payments_account_id}:")
+                print(f"  paying_manager_customer: {pa.paying_manager_customer}")
+                print(f"  extracted manager_cid: {manager_cid}")
+                print(f"  mcc_id: {mcc_id}")
+                print(f"  match: {manager_cid == mcc_id}")
+                
+                if manager_cid == mcc_id:
+                    manager_payments_accounts.append(account)
+                    print(f"  ✓ ADDED to manager_payments_accounts")
 
         can_do_billing = len(manager_payments_accounts) > 0
 
@@ -222,10 +223,10 @@ def check_manager_billing_accounts():
                 f"out of {len(all_payments_accounts)} total. "
                 f"Programmatic billing is {'POSSIBLE' if can_do_billing else 'NOT POSSIBLE'}."
             ),
-            "note": (
-                "If manager_payments_accounts_count > 0, you can attempt programmatic "
-                "BillingSetup via /assign-billing-setup. If count = 0, only manual billing "
-                "via Google Ads UI + logical soft caps are supported."
+            "next_step": (
+                "If can_do_programmatic_billing=true, you can call /assign-billing-setup with "
+                "one of the manager_payments_accounts[].payments_account_id values. "
+                "If false, use manual billing via Google Ads UI + logical soft caps."
             ),
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
@@ -244,6 +245,7 @@ def check_manager_billing_accounts():
         }), 400
 
     except Exception as e:
+        print(f"[CHECK-MANAGER-BILLING] EXCEPTION: {str(e)}")
         return jsonify({
             "success": False,
             "can_do_programmatic_billing": False,
