@@ -81,6 +81,7 @@ def index():
         }
     })
 
+
 @app.route('/list-payments-accounts', methods=['GET'])
 def list_payments_accounts():
     """
@@ -127,40 +128,6 @@ def list_payments_accounts():
 
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
-
-
-@app.route('/list-payments-accounts', methods=['GET'])
-def list_payments_accounts():
-    """Diagnostic: list payments accounts visible to this MCC via API."""
-    # Your helper returns (client, config), unpack it
-    client, config = load_google_ads_client()
-
-    # Prefer login_customer_id from config; fall back to MCC_CUSTOMER_ID if needed
-    mcc_id = str(config.get("login_customer_id")) if isinstance(config, dict) else str(MCC_CUSTOMER_ID)
-
-    service = client.get_service("PaymentsAccountService")
-    request = client.get_type("ListPaymentsAccountsRequest")
-    request.customer_id = mcc_id  # must be without dashes [web:691]
-
-    response = service.list_payments_accounts(request=request)
-
-    results = []
-    for pa in response.payments_accounts:
-        results.append({
-            "resource_name": pa.resource_name,
-            "payments_account_id": pa.payments_account_id,
-            "payments_account_name": pa.payments_account_name,
-            "payments_profile_id": pa.payments_profile_id,
-            "paying_manager_customer": pa.paying_manager_customer,
-        })
-
-    return jsonify({
-        "mcc_id": mcc_id,
-        "count": len(results),
-        "payments_accounts": results,
-    })
-
 
 
 # ============================================================================
