@@ -721,6 +721,8 @@ def debug_account_health():
 # ENDPOINT 4: ASSIGN BILLING SETUP
 # ============================================================================
 
+from datetime import datetime, timedelta
+
 @app.route('/assign-billing-setup', methods=['POST'])
 def assign_billing_setup():
     """
@@ -743,6 +745,13 @@ def assign_billing_setup():
     payments_account_id = os.getenv("PAYMENTS_ACCOUNT_ID", "").strip()
     if not payments_account_id:
         return jsonify({"success": False, "errors": ["PAYMENTS_ACCOUNT_ID not configured in environment."]}), 500
+
+    # Optional: validate format xxxx-xxxx-xxxx-xxxx as per docs [web:45]
+    if not all(c.isdigit() or c == '-' for c in payments_account_id) or payments_account_id.count('-') != 3:
+        return jsonify({
+            "success": False,
+            "errors": [f"Payments account ID must be in format xxxx-xxxx-xxxx-xxxx. Got: {payments_account_id}"]
+        }), 400
 
     try:
         client, mcc_customer_id = load_google_ads_client()
@@ -790,19 +799,54 @@ def assign_billing_setup():
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
 
-        # 2) Build the payments_account resource name using the MCC (paying manager)
+        # 1b) (Optional but safer) if there is a cancelled/dangling setup with no payments_account, you could remove it here
+
+        # 2) Build the payments_account resource name using the SERVING CUSTOMER,
+        #    not the MCC, per official sample [web:45][web:26]
         payments_account_resource = (
-            f"customers/{mcc_clean}/paymentsAccounts/{payments_account_id}"
+            f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
         )
         print(f"[BILLING] Using payments_account resource: {payments_account_resource}")
+
+        # 2b) Determine start_date_time per official guidance:
+        #     - If there is an APPROVED billing_setup, start 1 day after its end_date_time
+        #     - Else, start today [web:45][web:83]
+        start_date = None
+        last_ending_date_time = None
+
+        date_query = """
+            SELECT
+              billing_setup.end_date_time
+            FROM billing_setup
+            WHERE billing_setup.status = APPROVED
+            ORDER BY billing_setup.end_date_time DESC
+            LIMIT 1
+        """
+        print("[BILLING] Checking for existing APPROVED billing setups to set start_date_time...")
+        for row in ga_service.search(customer_id=customer_id, query=date_query):
+            last_ending_date_time = row.billing_setup.end_date_time
+            print(f"[BILLING] Last approved billing_setup end_date_time: {last_ending_date_time}")
+            break
+
+        if last_ending_date_time:
+            # Could be "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+            try:
+                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d")
+            except ValueError:
+                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d %H:%M:%S")
+            start_date = end_dt + timedelta(days=1)
+        else:
+            start_date = datetime.utcnow()
+
+        start_date_time_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[BILLING] start_date_time to be used: {start_date_time_str}")
 
         # 3) Create billing setup operation
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-
-        # Let Google determine the start date; do NOT set start_date_time manually
-        # unless Google support explicitly instructs otherwise.
+        # REQUIRED: set start_date_time (start_time) [web:63][web:83]
+        billing_setup.start_date_time = start_date_time_str
 
         print("[BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
@@ -819,7 +863,8 @@ def assign_billing_setup():
             "mcc_id": mcc_customer_id,
             "payments_account_resource": payments_account_resource,
             "new_billing_setup": new_resource,
-            "message": "Billing setup request sent successfully via API.",
+            "start_date_time": start_date_time_str,
+            "message": "Billing setup request sent successfully via API. Status will be PENDING until approved.",
             "status": "PENDING",
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
@@ -857,7 +902,6 @@ def assign_billing_setup():
     except Exception as e:
         print(f"[BILLING] EXCEPTION: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
 
 
 
