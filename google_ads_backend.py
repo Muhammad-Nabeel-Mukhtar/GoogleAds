@@ -492,7 +492,7 @@ def create_account():
             invitation_operation = client.get_type("CustomerUserAccessInvitationOperation")
             invitation = invitation_operation.create
             invitation.email_address = email
-            invitation.access_role = "READ_ONLY"
+            invitation.access_role = client.enums.AccessRoleEnum.STANDARD
             invitation_service.mutate_customer_user_access_invitation(
                 customer_id=customer_id,
                 operation=invitation_operation
@@ -504,7 +504,7 @@ def create_account():
                 "customer_id": customer_id,
                 "invite_sent": True,
                 "invited_email": email,
-                "role": "READ_ONLY",
+                "role": "STANDARD",
                 "message": f"Account {name} created. Customer ID: {customer_id}. Next: Call /assign-billing-setup",
                 "accounts": []
             }), 200
