@@ -138,6 +138,47 @@ def debug_mcc_billing_setups():
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
 
+@app.route('/debug-billing-status', methods=['GET'])
+def debug_billing_status():
+    """GET /debug-billing-status?customer_id=XXXX"""
+    customer_id = request.args.get('customer_id', '').strip()
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
+
+    try:
+        client, _ = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        query = """
+            SELECT
+              billing_setup.id,
+              billing_setup.resource_name,
+              billing_setup.status
+            FROM billing_setup
+            ORDER BY billing_setup.id
+        """
+
+        rows = ga_service.search(customer_id=customer_id, query=query)
+        setups = []
+        for row in rows:
+            setups.append({
+                "id": row.billing_setup.id,
+                "resource_name": row.billing_setup.resource_name,
+                "status": row.billing_setup.status.name,
+            })
+
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "billing_setups": setups
+        }), 200
+
+    except GoogleAdsException as e:
+        errs = [{"code": str(err.error_code), "message": err.message} for err in e.failure.errors]
+        return jsonify({"success": False, "errors": errs}), 400
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
 
 
 @app.route('/list-payments-accounts', methods=['GET'])
