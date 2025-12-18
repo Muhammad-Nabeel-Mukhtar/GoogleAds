@@ -1025,8 +1025,8 @@ def approve_topup():
     POST /approve-topup
 
     Behavior:
-    - Always records the top-up amount as soft-cap info (DB layer, not shown here).
-    - If the account has an APPROVED billing_setup, it will:
+    - Requires a billing_setup in APPROVED_HELD / APPROVED / ACTIVE.
+    - If such a billing setup exists, it will:
         * CREATE a new AccountBudget if none exists yet, or
         * UPDATE the existing AccountBudget's spending limit.
       This behaves like setting an actual budget (hard cap) in the Google Ads UI.
@@ -1084,9 +1084,7 @@ def approve_topup():
                     "errors": ["Unable to determine account currency."]
                 }), 400
 
-            soft_cap_status = "STORED_IN_DB"  # your DB logic, not shown
-
-            # 2) Find an APPROVED billing setup (required for true hard caps)
+            # 2) Find a usable billing setup (APPROVED_HELD / APPROVED / ACTIVE)
             billing_query = """
                 SELECT
                   billing_setup.id,
@@ -1101,41 +1099,26 @@ def approve_topup():
             for row in ga_service.search(customer_id=customer_id, query=billing_query):
                 status_name = row.billing_setup.status.name
                 print(f"[TOPUP] Billing setup: id={row.billing_setup.id}, status={status_name}")
-                # Treat APPROVED (or ACTIVE depending on version) as usable
-                if status_name in ("APPROVED", "ACTIVE"):
+
+                # For monthly invoicing, APPROVED_HELD means billing is approved
+                # but first account budget is not; we still can create it here.[web:78]
+                if status_name in ("APPROVED_HELD", "APPROVED", "ACTIVE"):
                     billing_setup_resource = row.billing_setup.resource_name
                     billing_status = status_name
                     break
+
                 if billing_status is None:
                     billing_status = status_name  # remember something for message
 
-            hard_cap_status = "NOT_ATTEMPTED"
-            account_budget_proposal_resource = None
-            proposal_id = None
-            new_spending_limit_micros = None
-
-            # 2a) If no approved billing setup yet, skip hard cap and return soft-cap only
             if not billing_setup_resource:
                 msg = (
-                    f"Topup of {topup_amount} {customer_currency} approved as SOFT CAP only. "
-                    f"No APPROVED billing setup found yet (latest status: {billing_status or 'NONE'}). "
-                    f"A hard cap (account budget) will be created/updated automatically once billing is fully approved."
+                    f"No usable billing setup found. Latest status: {billing_status or 'NONE'}. "
+                    f"Billing setup must be APPROVED_HELD, APPROVED, or ACTIVE before approving topups."
                 )
                 return jsonify({
-                    "success": True,
-                    "customer_id": customer_id,
-                    "topup_amount": topup_amount,
-                    "currency": customer_currency,
-                    "topup_micros": topup_micros,
-                    "new_spending_limit_micros": None,
-                    "new_spending_limit": None,
-                    "hard_cap_status": hard_cap_status,
-                    "hard_cap_proposal_id": None,
-                    "soft_cap_status": soft_cap_status,
-                    "account_budget_proposal_resource": None,
-                    "message": msg,
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                }), 200
+                    "success": False,
+                    "errors": [msg]
+                }), 400
 
             # 3) Check if an account_budget already exists
             budget_query = """
@@ -1160,8 +1143,12 @@ def approve_topup():
             proposal_type_enum = client.enums.AccountBudgetProposalTypeEnum
             time_type_enum = client.enums.TimeTypeEnum
 
+            new_spending_limit_micros = None
+            proposal_id = None
+            account_budget_proposal_resource = None
+
             if existing_budget:
-                # UPDATE: increase existing limit
+                # UPDATE: increase existing limit[web:846]
                 current_limit = (
                     existing_budget.proposed_spending_limit_micros
                     or existing_budget.approved_spending_limit_micros
@@ -1183,7 +1170,7 @@ def approve_topup():
                 operation.update_mask.paths.append("proposed_notes")
 
             else:
-                # CREATE: new account budget with topup as initial cap
+                # CREATE: new account budget with topup as initial cap[web:846]
                 new_spending_limit_micros = topup_micros
                 proposal.proposal_type = proposal_type_enum.CREATE
                 proposal.billing_setup = billing_setup_resource
@@ -1196,7 +1183,7 @@ def approve_topup():
                 proposal.proposed_start_time_type = time_type_enum.NOW
                 proposal.proposed_end_time_type = time_type_enum.FOREVER
 
-            # 4) Send AccountBudgetProposal (hard cap)
+            # 4) Send AccountBudgetProposal (hard cap)[web:846][web:893]
             try:
                 response = proposal_service.mutate_account_budget_proposal(
                     customer_id=customer_id,
@@ -1206,15 +1193,21 @@ def approve_topup():
                 proposal_id = account_budget_proposal_resource.split("/")[-1]
                 hard_cap_status = "PENDING"
             except GoogleAdsException as e:
-                hard_cap_status = "FAILED_USING_SOFT_CAP"
+                hard_cap_status = "FAILED"
                 print("===== Hard cap failed =====")
                 print("Customer ID:", customer_id)
                 for error in e.failure.errors:
                     print("  Error:", error.message)
 
+                return jsonify({
+                    "success": False,
+                    "errors": ["Failed to create/update AccountBudget via AccountBudgetProposal.", str(e)]
+                }), 500
+
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
+                "billing_setup_status": billing_status,
                 "topup_amount": topup_amount,
                 "currency": customer_currency,
                 "topup_micros": topup_micros,
@@ -1222,11 +1215,11 @@ def approve_topup():
                 "new_spending_limit": (new_spending_limit_micros / 1e6) if new_spending_limit_micros else None,
                 "hard_cap_status": hard_cap_status,
                 "hard_cap_proposal_id": proposal_id,
-                "soft_cap_status": soft_cap_status,
                 "account_budget_proposal_resource": account_budget_proposal_resource,
                 "message": (
-                    f"Topup of {topup_amount} {customer_currency} approved. "
-                    f"Hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}."
+                    f"Topup of {topup_amount} {customer_currency} submitted as "
+                    f"AccountBudgetProposal ({'CREATE' if not existing_budget else 'UPDATE'}). "
+                    f"Status: {hard_cap_status}."
                 ),
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
@@ -1243,6 +1236,7 @@ def approve_topup():
             return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}), 500
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+
 
 
 @app.route('/check-and-pause-campaigns', methods=['POST'])
