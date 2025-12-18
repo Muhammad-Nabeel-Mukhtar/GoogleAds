@@ -786,13 +786,19 @@ def assign_billing_setup():
     """
     POST /assign-billing-setup
 
-    Assigns billing setup to a client account by linking an existing
-    payments account ID (from env) to the given customer_id.
+    Tries to assign billing to a client account.
 
-    Expected JSON:
-    {
+    Priority:
+    1) If MCC_PAYMENTS_ACCOUNT_RESOURCE is set, use MCC-level payments account:
+         billing_setup.payments_account = MCC_PAYMENTS_ACCOUNT_RESOURCE
+    2) Else if CHILD_PAYMENTS_ACCOUNT_ID is set, use child-scoped resource:
+         billing_setup.payments_account =
+           f"customers/{customer_id}/paymentsAccounts/{CHILD_PAYMENTS_ACCOUNT_ID}"
+
+    Body:
+      {
         "customer_id": "1234567890"
-    }
+      }
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -800,31 +806,43 @@ def assign_billing_setup():
     if not customer_id or not customer_id.isdigit():
         return jsonify({"success": False, "errors": ["Valid numeric customer_id required."]}), 400
 
-    payments_account_id = os.getenv("PAYMENTS_ACCOUNT_ID", "").strip()
-    if not payments_account_id:
-        return jsonify({"success": False, "errors": ["PAYMENTS_ACCOUNT_ID not configured in environment."]}), 500
+    # 1) Read envs
+    mcc_payments_resource = os.getenv("MCC_PAYMENTS_ACCOUNT_RESOURCE", "").strip()
+    child_payments_id = os.getenv("CHILD_PAYMENTS_ACCOUNT_ID", "").strip()
 
-    # Optional: validate format xxxx-xxxx-xxxx-xxxx as per docs [web:45]
-    if not all(c.isdigit() or c == '-' for c in payments_account_id) or payments_account_id.count('-') != 3:
+    if not mcc_payments_resource and not child_payments_id:
         return jsonify({
             "success": False,
-            "errors": [f"Payments account ID must be in format xxxx-xxxx-xxxx-xxxx. Got: {payments_account_id}"]
-        }), 400
+            "errors": [
+                "No payments account configured. "
+                "Set MCC_PAYMENTS_ACCOUNT_RESOURCE or CHILD_PAYMENTS_ACCOUNT_ID in environment."
+            ]
+        }), 500
 
     try:
         client, mcc_customer_id = load_google_ads_client()
         billing_setup_service = client.get_service("BillingSetupService")
         ga_service = client.get_service("GoogleAdsService")
 
-        mcc_clean = str(mcc_customer_id).replace("-", "").strip()
+        print("\n[ASSIGN_BILLING] Starting...")
+        print(f"[ASSIGN_BILLING] MCC login_customer_id: {mcc_customer_id}")
+        print(f"[ASSIGN_BILLING] Target child customer_id: {customer_id}")
+        print(f"[ASSIGN_BILLING] MCC_PAYMENTS_ACCOUNT_RESOURCE: {mcc_payments_resource or 'NONE'}")
+        print(f"[ASSIGN_BILLING] CHILD_PAYMENTS_ACCOUNT_ID: {child_payments_id or 'NONE'}")
 
-        print("\n[BILLING] Starting...")
-        print(f"[BILLING] MCC ID: {mcc_customer_id}")
-        print(f"[BILLING] MCC (clean): {mcc_clean}")
-        print(f"[BILLING] Client ID: {customer_id}")
-        print(f"[BILLING] Payments Account ID (env): {payments_account_id}")
+        # 2) If MCC-level payments account is configured, prefer that
+        if mcc_payments_resource:
+            payments_account_resource = mcc_payments_resource
+        else:
+            # Boss-style: child-scoped payments account
+            # Format customers/{customer_id}/paymentsAccounts/{id}
+            payments_account_resource = (
+                f"customers/{customer_id}/paymentsAccounts/{child_payments_id}"
+            )
 
-        # 1) Check if there is already a billing setup using this payments account
+        print(f"[ASSIGN_BILLING] Using payments_account: {payments_account_resource}")
+
+        # 3) Check if a billing setup already exists using this payments_account
         check_query = """
             SELECT
               billing_setup.resource_name,
@@ -832,134 +850,66 @@ def assign_billing_setup():
               billing_setup.status
             FROM billing_setup
         """
-        print("[BILLING] Checking existing billing setups for this customer...")
-        existing_using_same = False
-        detected_payments_account = None
-
+        existing = None
         for row in ga_service.search(customer_id=customer_id, query=check_query):
             bs = row.billing_setup
-            print(f"[BILLING] Existing billing_setup: {bs.resource_name}, "
-                  f"status={bs.status.name}, payments_account={bs.payments_account}")
-            if bs.payments_account and payments_account_id in bs.payments_account:
-                existing_using_same = True
-                detected_payments_account = bs.payments_account
+            if bs.payments_account == payments_account_resource:
+                existing = bs
                 break
 
-        if existing_using_same:
-            # Idempotent behavior: already assigned
+        if existing:
             return jsonify({
                 "success": True,
                 "customer_id": customer_id,
-                "mcc_id": mcc_customer_id,
-                "payments_account_resource": detected_payments_account,
-                "message": "Billing setup already exists and uses this payments account. No new setup created.",
-                "status": "ALREADY_ASSIGNED",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "mcc_id": str(mcc_customer_id),
+                "payments_account": payments_account_resource,
+                "billing_setup_resource": existing.resource_name,
+                "status": existing.status.name,
+                "message": "Billing setup already exists for this payments account.",
+                "result": "ALREADY_ASSIGNED"
             }), 200
 
-        # 1b) (Optional but safer) if there is a cancelled/dangling setup with no payments_account, you could remove it here
-
-        # 2) Build the payments_account resource name using the SERVING CUSTOMER,
-        #    not the MCC, per official sample [web:45][web:26]
-        payments_account_resource = (
-            f"customers/{customer_id}/paymentsAccounts/{payments_account_id}"
-        )
-        print(f"[BILLING] Using payments_account resource: {payments_account_resource}")
-
-        # 2b) Determine start_date_time per official guidance:
-        #     - If there is an APPROVED billing_setup, start 1 day after its end_date_time
-        #     - Else, start today [web:45][web:83]
-        start_date = None
-        last_ending_date_time = None
-
-        date_query = """
-            SELECT
-              billing_setup.end_date_time
-            FROM billing_setup
-            WHERE billing_setup.status = APPROVED
-            ORDER BY billing_setup.end_date_time DESC
-            LIMIT 1
-        """
-        print("[BILLING] Checking for existing APPROVED billing setups to set start_date_time...")
-        for row in ga_service.search(customer_id=customer_id, query=date_query):
-            last_ending_date_time = row.billing_setup.end_date_time
-            print(f"[BILLING] Last approved billing_setup end_date_time: {last_ending_date_time}")
-            break
-
-        if last_ending_date_time:
-            # Could be "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
-            try:
-                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d")
-            except ValueError:
-                end_dt = datetime.strptime(last_ending_date_time, "%Y-%m-%d %H:%M:%S")
-            start_date = end_dt + timedelta(days=1)
-        else:
-            start_date = datetime.utcnow()
-
-        start_date_time_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[BILLING] start_date_time to be used: {start_date_time_str}")
-
-        # 3) Create billing setup operation
+        # 4) Create new billing setup
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-        # REQUIRED: set start_date_time (start_time) [web:63][web:83]
-        billing_setup.start_date_time = start_date_time_str
+        # Easiest stable option: start now
+        billing_setup.start_time_type = client.enums.TimeTypeEnum.NOW
 
-        print("[BILLING] Calling mutate_billing_setup...")
+        print("[ASSIGN_BILLING] Calling mutate_billing_setup...")
         response = billing_setup_service.mutate_billing_setup(
             customer_id=customer_id,
             operation=operation
         )
 
         new_resource = response.result.resource_name
-        print(f"[BILLING] SUCCESS: {new_resource}\n")
+        print(f"[ASSIGN_BILLING] SUCCESS: {new_resource}")
 
         return jsonify({
             "success": True,
             "customer_id": customer_id,
-            "mcc_id": mcc_customer_id,
-            "payments_account_resource": payments_account_resource,
-            "new_billing_setup": new_resource,
-            "start_date_time": start_date_time_str,
-            "message": "Billing setup request sent successfully via API. Status will be PENDING until approved.",
+            "mcc_id": str(mcc_customer_id),
+            "payments_account": payments_account_resource,
+            "billing_setup_resource": new_resource,
             "status": "PENDING",
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "message": "Billing setup created successfully. Status will be PENDING until Google approves.",
+            "result": "CREATED"
         }), 200
 
     except GoogleAdsException as e:
         error_details = []
-        has_same_payments_error = False
-
         for err in e.failure.errors:
-            code_str = str(err.error_code)
-            msg = err.message or ""
             error_details.append({
-                "error_code": code_str,
-                "message": msg
+                "error_code": str(err.error_code),
+                "message": err.message
             })
-            if "CANNOT_CHANGE_BILLING_TO_SAME_PAYMENTS_ACCOUNT" in code_str or \
-               "CANNOT_CHANGE_BILLING_TO_SAME_PAYMENTS_ACCOUNT" in msg:
-                has_same_payments_error = True
-
-        print(f"[BILLING] ERROR: {error_details}")
-
-        if has_same_payments_error:
-            return jsonify({
-                "success": True,
-                "customer_id": customer_id,
-                "mcc_id": mcc_customer_id,
-                "payments_account_resource": payments_account_resource,
-                "message": "Billing setup already exists and uses this payments account. No new setup created.",
-                "status": "ALREADY_ASSIGNED",
-                "timestamp": datetime.utcnow().isoformat() + "Z"
-            }), 200
-
+        print(f"[ASSIGN_BILLING] GoogleAdsException: {error_details}")
         return jsonify({"success": False, "errors": error_details}), 400
 
     except Exception as e:
-        print(f"[BILLING] EXCEPTION: {str(e)}")
+        print(f"[ASSIGN_BILLING] Exception: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
+
 
 
 
