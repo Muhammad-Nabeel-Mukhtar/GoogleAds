@@ -87,20 +87,12 @@ def debug_mcc_billing_setups():
     """
     GET /debug-mcc-billing-setups
 
-    Runs:
-      SELECT
-        billing_setup.payments_account,
-        billing_setup.payments_account_info.payments_account_id,
-        billing_setup.payments_account_info.payments_account_name,
-        billing_setup.payments_account_info.payments_profile_name,
-        billing_setup.payments_account_info.payments_profile_id,
-        billing_setup.payments_account_info.secondary_payments_profile_id
-      FROM billing_setup
-
-    against the MCC login_customer_id from google-ads.yaml.
+    Runs Google's recommended query against the MCC login_customer_id
+    (from google-ads.yaml) to check if any billing setups / payments
+    accounts exist at manager level.
     """
     try:
-        client, mcc_id = load_google_ads_client()  # mcc_id must be '1331285009' (no dashes)
+        client, mcc_id = load_google_ads_client()  # login_customer_id should be 1331285009
 
         ga_service = client.get_service("GoogleAdsService")
         query = """
@@ -145,6 +137,7 @@ def debug_mcc_billing_setups():
 
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
+
 
 
 @app.route('/list-payments-accounts', methods=['GET'])
