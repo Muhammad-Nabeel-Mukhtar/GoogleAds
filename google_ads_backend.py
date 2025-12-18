@@ -82,6 +82,71 @@ def index():
     })
 
 
+@app.route('/debug-mcc-billing-setups', methods=['GET'])
+def debug_mcc_billing_setups():
+    """
+    GET /debug-mcc-billing-setups
+
+    Runs:
+      SELECT
+        billing_setup.payments_account,
+        billing_setup.payments_account_info.payments_account_id,
+        billing_setup.payments_account_info.payments_account_name,
+        billing_setup.payments_account_info.payments_profile_name,
+        billing_setup.payments_account_info.payments_profile_id,
+        billing_setup.payments_account_info.secondary_payments_profile_id
+      FROM billing_setup
+
+    against the MCC login_customer_id from google-ads.yaml.
+    """
+    try:
+        client, mcc_id = load_google_ads_client()  # mcc_id must be '1331285009' (no dashes)
+
+        ga_service = client.get_service("GoogleAdsService")
+        query = """
+            SELECT
+              billing_setup.payments_account,
+              billing_setup.payments_account_info.payments_account_id,
+              billing_setup.payments_account_info.payments_account_name,
+              billing_setup.payments_account_info.payments_profile_name,
+              billing_setup.payments_account_info.payments_profile_id,
+              billing_setup.payments_account_info.secondary_payments_profile_id
+            FROM billing_setup
+        """
+
+        rows = ga_service.search(customer_id=str(mcc_id), query=query)
+
+        results = []
+        for row in rows:
+            bs = row.billing_setup
+            info = bs.payments_account_info
+            results.append({
+                "billing_setup_resource": bs.resource_name,
+                "payments_account": bs.payments_account,
+                "payments_account_id": info.payments_account_id,
+                "payments_account_name": info.payments_account_name,
+                "payments_profile_name": info.payments_profile_name,
+                "payments_profile_id": info.payments_profile_id,
+                "secondary_payments_profile_id": info.secondary_payments_profile_id,
+            })
+
+        return jsonify({
+            "success": True,
+            "mcc_id": str(mcc_id),
+            "count": len(results),
+            "billing_setups": results,
+        }), 200
+
+    except GoogleAdsException as e:
+        errs = []
+        for err in e.failure.errors:
+            errs.append({"code": str(err.error_code), "message": err.message})
+        return jsonify({"success": False, "errors": errs}), 400
+
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
 @app.route('/list-payments-accounts', methods=['GET'])
 def list_payments_accounts():
     """
