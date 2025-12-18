@@ -983,12 +983,17 @@ def approve_topup():
     """
     POST /approve-topup
 
-    Stores top-up as soft cap in DB and attempts to set hard cap via AccountBudgetProposal.
+    Behavior:
+    - Always records the top-up amount as soft-cap info (DB layer, not shown here).
+    - If the account has an APPROVED billing_setup, it will:
+        * CREATE a new AccountBudget if none exists yet, or
+        * UPDATE the existing AccountBudget's spending limit.
+      This behaves like setting an actual budget (hard cap) in the Google Ads UI.
 
-    Expected JSON:
+    JSON:
     {
-        "customer_id": "1234567890",
-        "topup_amount": 100
+      "customer_id": "1234567890",
+      "topup_amount": 100
     }
     """
     data = request.json or {}
@@ -1011,7 +1016,6 @@ def approve_topup():
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
 
-    # Topup in micros (this is the increment we want to add)
     topup_micros = int(topup_amount * 1_000_000)
 
     for attempt in range(3):
@@ -1020,10 +1024,10 @@ def approve_topup():
             ga_service = client.get_service("GoogleAdsService")
             proposal_service = client.get_service("AccountBudgetProposalService")
 
-            # Fetch client currency
+            # 1) Get account currency
             customer_query = """
                 SELECT
-                    customer.currency_code
+                  customer.currency_code
                 FROM customer
                 LIMIT 1
             """
@@ -1034,52 +1038,93 @@ def approve_topup():
                 break
 
             if not customer_currency:
-                return jsonify({"success": False, "errors": ["Unable to determine account currency."]}), 400
+                return jsonify({
+                    "success": False,
+                    "errors": ["Unable to determine account currency."]
+                }), 400
 
-            soft_cap_status = "STORED_IN_DB"
+            soft_cap_status = "STORED_IN_DB"  # your DB logic, not shown
 
-            # Check existing account_budget
-            budget_query = """
+            # 2) Find an APPROVED billing setup (required for true hard caps)
+            billing_query = """
                 SELECT
-                    account_budget.id,
-                    account_budget.resource_name,
-                    account_budget.status,
-                    account_budget.approved_spending_limit_micros,
-                    account_budget.proposed_spending_limit_micros,
-                    account_budget.billing_setup
-                FROM account_budget
-                ORDER BY account_budget.id
+                  billing_setup.id,
+                  billing_setup.resource_name,
+                  billing_setup.status
+                FROM billing_setup
+                ORDER BY billing_setup.id
             """
-            try:
-                budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
-                existing_budget = None
-                for row in budget_response:
-                    existing_budget = row.account_budget
-                    print(f"[DEBUG] Found EXISTING account_budget: id={existing_budget.id}")
-                    break
+            billing_setup_resource = None
+            billing_status = None
 
-                if existing_budget is None:
-                    print(f"[DEBUG] No existing account_budget for {customer_id}. Will CREATE new one.")
-            except Exception as e:
-                print(f"[DEBUG] Error querying account_budget: {str(e)}")
-                existing_budget = None
+            for row in ga_service.search(customer_id=customer_id, query=billing_query):
+                status_name = row.billing_setup.status.name
+                print(f"[TOPUP] Billing setup: id={row.billing_setup.id}, status={status_name}")
+                # Treat APPROVED (or ACTIVE depending on version) as usable
+                if status_name in ("APPROVED", "ACTIVE"):
+                    billing_setup_resource = row.billing_setup.resource_name
+                    billing_status = status_name
+                    break
+                if billing_status is None:
+                    billing_status = status_name  # remember something for message
 
             hard_cap_status = "NOT_ATTEMPTED"
             account_budget_proposal_resource = None
             proposal_id = None
             new_spending_limit_micros = None
 
+            # 2a) If no approved billing setup yet, skip hard cap and return soft-cap only
+            if not billing_setup_resource:
+                msg = (
+                    f"Topup of {topup_amount} {customer_currency} approved as SOFT CAP only. "
+                    f"No APPROVED billing setup found yet (latest status: {billing_status or 'NONE'}). "
+                    f"A hard cap (account budget) will be created/updated automatically once billing is fully approved."
+                )
+                return jsonify({
+                    "success": True,
+                    "customer_id": customer_id,
+                    "topup_amount": topup_amount,
+                    "currency": customer_currency,
+                    "topup_micros": topup_micros,
+                    "new_spending_limit_micros": None,
+                    "new_spending_limit": None,
+                    "hard_cap_status": hard_cap_status,
+                    "hard_cap_proposal_id": None,
+                    "soft_cap_status": soft_cap_status,
+                    "account_budget_proposal_resource": None,
+                    "message": msg,
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }), 200
+
+            # 3) Check if an account_budget already exists
+            budget_query = """
+                SELECT
+                  account_budget.id,
+                  account_budget.resource_name,
+                  account_budget.status,
+                  account_budget.approved_spending_limit_micros,
+                  account_budget.proposed_spending_limit_micros
+                FROM account_budget
+                ORDER BY account_budget.id
+            """
+            budget_response = ga_service.search(customer_id=customer_id, query=budget_query)
+            existing_budget = None
+            for row in budget_response:
+                existing_budget = row.account_budget
+                print(f"[TOPUP] Found existing account_budget: id={existing_budget.id}")
+                break
+
             operation = client.get_type("AccountBudgetProposalOperation")
             proposal = operation.create
-
             proposal_type_enum = client.enums.AccountBudgetProposalTypeEnum
             time_type_enum = client.enums.TimeTypeEnum
 
-            proposal_type_name = None
-
             if existing_budget:
-                # ACCUMULATE: take current limit and add topup
-                current_limit = existing_budget.proposed_spending_limit_micros or existing_budget.approved_spending_limit_micros
+                # UPDATE: increase existing limit
+                current_limit = (
+                    existing_budget.proposed_spending_limit_micros
+                    or existing_budget.approved_spending_limit_micros
+                )
                 if current_limit is None or current_limit == 0:
                     new_spending_limit_micros = topup_micros
                 else:
@@ -1095,56 +1140,36 @@ def approve_topup():
                 )
                 operation.update_mask.paths.append("proposed_spending_limit_micros")
                 operation.update_mask.paths.append("proposed_notes")
-                proposal_type_name = "UPDATE"
+
             else:
-                # CREATE new budget with topup as initial limit
-                billing_query = """
-                    SELECT
-                        billing_setup.id,
-                        billing_setup.resource_name,
-                        billing_setup.status
-                    FROM billing_setup
-                    ORDER BY billing_setup.id
-                """
-                billing_response = ga_service.search(customer_id=customer_id, query=billing_query)
+                # CREATE: new account budget with topup as initial cap
+                new_spending_limit_micros = topup_micros
+                proposal.proposal_type = proposal_type_enum.CREATE
+                proposal.billing_setup = billing_setup_resource
+                proposal.proposed_spending_limit_micros = new_spending_limit_micros
+                proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
+                proposal.proposed_notes = (
+                    f"Created via /approve-topup. "
+                    f"Initial limit: {topup_amount} {customer_currency}."
+                )
+                proposal.proposed_start_time_type = time_type_enum.NOW
+                proposal.proposed_end_time_type = time_type_enum.FOREVER
 
-                billing_setup_resource = None
-                for row in billing_response:
-                    status_name = row.billing_setup.status.name
-                    print(f"[DEBUG] Billing setup: id={row.billing_setup.id}, status={status_name}")
-                    if status_name in ("APPROVED", "ACTIVE"):
-                        billing_setup_resource = row.billing_setup.resource_name
-                        break
-
-                if billing_setup_resource:
-                    new_spending_limit_micros = topup_micros
-                    proposal.proposal_type = proposal_type_enum.CREATE
-                    proposal.billing_setup = billing_setup_resource
-                    proposal.proposed_spending_limit_micros = new_spending_limit_micros
-                    proposal.proposed_name = f"Top-up budget: {topup_amount} {customer_currency}"
-                    proposal.proposed_notes = (
-                        f"Created via /approve-topup. "
-                        f"Initial limit: {topup_amount} {customer_currency}."
-                    )
-                    proposal.proposed_start_time_type = time_type_enum.NOW
-                    proposal.proposed_end_time_type = time_type_enum.FOREVER
-                    proposal_type_name = "CREATE"
-
-            if proposal_type_name and new_spending_limit_micros is not None:
-                try:
-                    response = proposal_service.mutate_account_budget_proposal(
-                        customer_id=customer_id,
-                        operation=operation
-                    )
-                    account_budget_proposal_resource = response.result.resource_name
-                    proposal_id = account_budget_proposal_resource.split("/")[-1]
-                    hard_cap_status = "PENDING"
-                except GoogleAdsException as e:
-                    hard_cap_status = "FAILED_USING_SOFT_CAP"
-                    print("===== Hard cap failed =====")
-                    print("Customer ID:", customer_id)
-                    for error in e.failure.errors:
-                        print("  Error:", error.message)
+            # 4) Send AccountBudgetProposal (hard cap)
+            try:
+                response = proposal_service.mutate_account_budget_proposal(
+                    customer_id=customer_id,
+                    operation=operation
+                )
+                account_budget_proposal_resource = response.result.resource_name
+                proposal_id = account_budget_proposal_resource.split("/")[-1]
+                hard_cap_status = "PENDING"
+            except GoogleAdsException as e:
+                hard_cap_status = "FAILED_USING_SOFT_CAP"
+                print("===== Hard cap failed =====")
+                print("Customer ID:", customer_id)
+                for error in e.failure.errors:
+                    print("  Error:", error.message)
 
             return jsonify({
                 "success": True,
@@ -1160,7 +1185,7 @@ def approve_topup():
                 "account_budget_proposal_resource": account_budget_proposal_resource,
                 "message": (
                     f"Topup of {topup_amount} {customer_currency} approved. "
-                    f"New hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}."
+                    f"Hard cap: {hard_cap_status}. Soft cap: {soft_cap_status}."
                 ),
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }), 200
@@ -1170,10 +1195,14 @@ def approve_topup():
                 if attempt < 2:
                     time.sleep(5)
                     continue
-                return jsonify({"success": False, "errors": ["Network error. Please try again.", str(e)]}), 500
+                return jsonify({
+                    "success": False,
+                    "errors": ["Network error. Please try again later.", str(e)]
+                }), 500
             return jsonify({"success": False, "errors": [f"Error: {str(e)}"]}), 500
 
     return jsonify({"success": False, "errors": ["Max retries reached."]}), 500
+
 
 @app.route('/check-and-pause-campaigns', methods=['POST'])
 def check_and_pause_campaigns():
