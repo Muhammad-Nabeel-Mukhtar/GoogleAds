@@ -181,6 +181,27 @@ def debug_billing_status():
 
 from google.ads.googleads.errors import GoogleAdsException
 
+def ensure_customer_active(client, customer_id: str):
+    ga_service = client.get_service("GoogleAdsService")
+    query = """
+        SELECT
+          customer.id,
+          customer.descriptive_name,
+          customer.status
+        FROM customer
+        LIMIT 1
+    """
+    rows = ga_service.search(customer_id=customer_id, query=query)
+    for row in rows:
+        status = row.customer.status.name
+        name = row.customer.descriptive_name
+        if status != "ENABLED":
+            return False, status, name
+        return True, status, name
+    return False, None, None
+
+
+
 def _get_customer_status(client, customer_id: str):
     ga_service = client.get_service("GoogleAdsService")
     query = """
