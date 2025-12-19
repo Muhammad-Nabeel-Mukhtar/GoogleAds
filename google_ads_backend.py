@@ -371,6 +371,124 @@ def list_payments_accounts():
         return jsonify({"success": False, "errors": [str(e)]}), 500
 
 
+from google.ads.googleads.errors import GoogleAdsException
+
+@app.route('/check-user-invite-status', methods=['GET'])
+def check_user_invite_status():
+    """
+    GET /check-user-invite-status?customer_id=XXX&email=someone@example.com
+
+    Returns:
+      - invitation_status: PENDING / NOT_FOUND
+      - If NOT_FOUND, also tells you whether the user is already active on the account.
+    """
+    customer_id = (request.args.get('customer_id') or '').strip()
+    email = (request.args.get('email') or '').strip()
+
+    errors = []
+    if not customer_id or not customer_id.isdigit():
+        errors.append("Valid numeric customer_id required.")
+    if not email:
+        errors.append("email query parameter is required.")
+
+    if errors:
+        return jsonify({"success": False, "errors": errors}), 400
+
+    try:
+        client, _ = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+
+        # 1) Check pending invitations for this email
+        invite_query = f"""
+            SELECT
+              customer_user_access_invitation.invitation_id,
+              customer_user_access_invitation.email_address,
+              customer_user_access_invitation.access_role,
+              customer_user_access_invitation.invitation_status,
+              customer_user_access_invitation.creation_date_time
+            FROM
+              customer_user_access_invitation
+            WHERE
+              customer_user_access_invitation.email_address = '{email}'
+        """
+
+        pending_invites = []
+        for row in ga_service.search(customer_id=customer_id, query=invite_query):
+            inv = row.customer_user_access_invitation
+            pending_invites.append({
+                "invitation_id": inv.invitation_id,
+                "email": inv.email_address,
+                "access_role": inv.access_role.name,
+                "invitation_status": inv.invitation_status.name,
+                "creation_date_time": inv.creation_date_time,
+            })
+
+        # 2) If at least one invitation is still PENDING, report that
+        for inv in pending_invites:
+            if inv["invitation_status"] == "PENDING":
+                return jsonify({
+                    "success": True,
+                    "customer_id": customer_id,
+                    "email": email,
+                    "invitation_status": "PENDING",
+                    "details": inv,
+                    "message": "User invitation is still PENDING for this email."
+                }), 200
+
+        # 3) No pending invite; check if user is already active on the account
+        access_query = f"""
+            SELECT
+              customer_user_access.user_id,
+              customer_user_access.email_address,
+              customer_user_access.access_role,
+              customer_user_access.access_creation_date_time,
+              customer_user_access.inviter_user_email_address
+            FROM
+              customer_user_access
+            WHERE
+              customer_user_access.email_address = '{email}'
+        """
+
+        active_user = None
+        for row in ga_service.search(customer_id=customer_id, query=access_query):
+            ua = row.customer_user_access
+            active_user = {
+                "user_id": ua.user_id,
+                "email": ua.email_address,
+                "access_role": ua.access_role.name,
+                "access_creation_date_time": ua.access_creation_date_time,
+                "inviter_email": ua.inviter_user_email_address,
+            }
+            break
+
+        if active_user:
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "email": email,
+                "invitation_status": "NOT_PENDING",
+                "user_active": True,
+                "active_user": active_user,
+                "message": "No pending invitation. User is already active on this account."
+            }), 200
+
+        # 4) No pending invite and no active user
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "email": email,
+            "invitation_status": "NOT_FOUND",
+            "user_active": False,
+            "message": "No pending invitation found and user is not active on this account."
+        }), 200
+
+    except GoogleAdsException as e:
+        errs = [{"code": str(err.error_code), "message": err.message} for err in e.failure.errors]
+        return jsonify({"success": False, "errors": errs}), 400
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
 @app.route('/check-manager-billing-accounts', methods=['GET'])
 def check_manager_billing_accounts():
     """
