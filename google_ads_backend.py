@@ -956,20 +956,6 @@ from datetime import datetime, timedelta
 def assign_billing_setup():
     """
     POST /assign-billing-setup
-
-    Tries to assign billing to a client account.
-
-    Priority:
-    1) If MCC_PAYMENTS_ACCOUNT_RESOURCE is set, use MCC-level payments account:
-         billing_setup.payments_account = MCC_PAYMENTS_ACCOUNT_RESOURCE
-    2) Else if CHILD_PAYMENTS_ACCOUNT_ID is set, use child-scoped resource:
-         billing_setup.payments_account =
-           f"customers/{customer_id}/paymentsAccounts/{CHILD_PAYMENTS_ACCOUNT_ID}"
-
-    Body:
-      {
-        "customer_id": "1234567890"
-      }
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -995,6 +981,18 @@ def assign_billing_setup():
         billing_setup_service = client.get_service("BillingSetupService")
         ga_service = client.get_service("GoogleAdsService")
 
+        # 1a) Block suspended / canceled / closed customers
+        ok, status, name = ensure_customer_active(client, customer_id)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "errors": [
+                    f"Customer {customer_id} ({name}) has status {status}. "
+                    "Billing setup is only allowed for ENABLED accounts."
+                ],
+                "customer_status": status,
+            }), 400
+
         print("\n[ASSIGN_BILLING] Starting...")
         print(f"[ASSIGN_BILLING] MCC login_customer_id: {mcc_customer_id}")
         print(f"[ASSIGN_BILLING] Target child customer_id: {customer_id}")
@@ -1005,8 +1003,6 @@ def assign_billing_setup():
         if mcc_payments_resource:
             payments_account_resource = mcc_payments_resource
         else:
-            # Boss-style: child-scoped payments account
-            # Format customers/{customer_id}/paymentsAccounts/{id}
             payments_account_resource = (
                 f"customers/{customer_id}/paymentsAccounts/{child_payments_id}"
             )
@@ -1044,7 +1040,6 @@ def assign_billing_setup():
         operation = client.get_type("BillingSetupOperation")
         billing_setup = operation.create
         billing_setup.payments_account = payments_account_resource
-        # Easiest stable option: start now
         billing_setup.start_time_type = client.enums.TimeTypeEnum.NOW
 
         print("[ASSIGN_BILLING] Calling mutate_billing_setup...")
@@ -1080,6 +1075,9 @@ def assign_billing_setup():
     except Exception as e:
         print(f"[ASSIGN_BILLING] Exception: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
+
 
 
 
@@ -1153,19 +1151,6 @@ def update_email():
 def approve_topup():
     """
     POST /approve-topup
-
-    Behavior:
-    - Requires a billing_setup in APPROVED_HELD / APPROVED / ACTIVE.
-    - If such a billing setup exists, it will:
-        * CREATE a new AccountBudget if none exists yet, or
-        * UPDATE the existing AccountBudget's spending limit.
-      This behaves like setting an actual budget (hard cap) in the Google Ads UI.
-
-    JSON:
-    {
-      "customer_id": "1234567890",
-      "topup_amount": 100
-    }
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -1194,6 +1179,18 @@ def approve_topup():
             client, _ = load_google_ads_client()
             ga_service = client.get_service("GoogleAdsService")
             proposal_service = client.get_service("AccountBudgetProposalService")
+
+            # 0) Block suspended / canceled / closed customers
+            ok, status, name = ensure_customer_active(client, customer_id)
+            if not ok:
+                return jsonify({
+                    "success": False,
+                    "errors": [
+                        f"Customer {customer_id} ({name}) has status {status}. "
+                        "Topups and account budgets are only allowed for ENABLED accounts."
+                    ],
+                    "customer_status": status,
+                }), 400
 
             # 1) Get account currency
             customer_query = """
@@ -1230,15 +1227,13 @@ def approve_topup():
                 status_name = row.billing_setup.status.name
                 print(f"[TOPUP] Billing setup: id={row.billing_setup.id}, status={status_name}")
 
-                # For monthly invoicing, APPROVED_HELD means billing is approved
-                # but first account budget is not; we still can create it here.[web:78]
                 if status_name in ("APPROVED_HELD", "APPROVED", "ACTIVE"):
                     billing_setup_resource = row.billing_setup.resource_name
                     billing_status = status_name
                     break
 
                 if billing_status is None:
-                    billing_status = status_name  # remember something for message
+                    billing_status = status_name
 
             if not billing_setup_resource:
                 msg = (
@@ -1278,7 +1273,6 @@ def approve_topup():
             account_budget_proposal_resource = None
 
             if existing_budget:
-                # UPDATE: increase existing limit[web:846]
                 current_limit = (
                     existing_budget.proposed_spending_limit_micros
                     or existing_budget.approved_spending_limit_micros
@@ -1300,7 +1294,6 @@ def approve_topup():
                 operation.update_mask.paths.append("proposed_notes")
 
             else:
-                # CREATE: new account budget with topup as initial cap[web:846]
                 new_spending_limit_micros = topup_micros
                 proposal.proposal_type = proposal_type_enum.CREATE
                 proposal.billing_setup = billing_setup_resource
@@ -1313,7 +1306,7 @@ def approve_topup():
                 proposal.proposed_start_time_type = time_type_enum.NOW
                 proposal.proposed_end_time_type = time_type_enum.FOREVER
 
-            # 4) Send AccountBudgetProposal (hard cap)[web:846][web:893]
+            # 4) Send AccountBudgetProposal
             try:
                 response = proposal_service.mutate_account_budget_proposal(
                     customer_id=customer_id,
