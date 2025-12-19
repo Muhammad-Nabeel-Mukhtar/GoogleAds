@@ -179,6 +179,136 @@ def debug_billing_status():
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
 
+from google.ads.googleads.errors import GoogleAdsException
+
+def _get_customer_status(client, customer_id: str):
+    ga_service = client.get_service("GoogleAdsService")
+    query = """
+        SELECT
+          customer.id,
+          customer.descriptive_name,
+          customer.status
+        FROM customer
+        LIMIT 1
+    """
+    rows = ga_service.search(customer_id=customer_id, query=query)
+    for row in rows:
+        return row.customer.status.name, row.customer.descriptive_name
+    return None, None
+
+
+@app.route('/end-all-budgets-if-suspended', methods=['POST'])
+def end_all_budgets_if_suspended():
+    """
+    POST /end-all-budgets-if-suspended
+
+    Body:
+    {
+      "customer_id": "1234567890"
+    }
+
+    Flow:
+    - Check customer.status.
+    - If not SUSPENDED -> return, no changes.
+    - If SUSPENDED -> find all active account_budgets and submit END proposals.
+    """
+    data = request.json or {}
+    customer_id = str(data.get('customer_id', '')).strip()
+
+    if not customer_id or not customer_id.isdigit():
+        return jsonify({"success": False, "errors": ["Valid numeric customer_id is required."]}), 400
+
+    try:
+        client, _ = load_google_ads_client()
+        ga_service = client.get_service("GoogleAdsService")
+        proposal_service = client.get_service("AccountBudgetProposalService")
+
+        # 1) Check customer status
+        status, name = _get_customer_status(client, customer_id)
+        if not status:
+            return jsonify({"success": False, "errors": ["Unable to fetch customer status."]}), 400
+
+        if status != "SUSPENDED":
+            return jsonify({
+                "success": False,
+                "errors": [f"Customer status is {status}, not SUSPENDED. No budget changes made."],
+                "customer_id": customer_id,
+                "customer_name": name
+            }), 400
+
+        # 2) Find all "active" account budgets (tune statuses as needed)
+        budget_query = """
+            SELECT
+              account_budget.id,
+              account_budget.resource_name,
+              account_budget.status,
+              account_budget.approved_spending_limit_micros
+            FROM account_budget
+            ORDER BY account_budget.id
+        """
+        budgets = []
+        for row in ga_service.search(customer_id=customer_id, query=budget_query):
+            b = row.account_budget
+            if b.status.name in ("APPROVED", "PENDING", "PROPOSED"):
+                budgets.append(b)
+
+        if not budgets:
+            return jsonify({
+                "success": True,
+                "customer_id": customer_id,
+                "customer_name": name,
+                "customer_status": status,
+                "ended_budgets": [],
+                "message": "Customer is SUSPENDED but no active account budgets were found."
+            }), 200
+
+        ended = []
+        for b in budgets:
+            op = client.get_type("AccountBudgetProposalOperation")
+            proposal = op.create
+            proposal_type_enum = client.enums.AccountBudgetProposalTypeEnum
+
+            proposal.proposal_type = proposal_type_enum.END
+            proposal.account_budget = b.resource_name
+            proposal.proposed_notes = (
+                "Ended via /end-all-budgets-if-suspended because customer status is SUSPENDED."
+            )
+
+            try:
+                resp = proposal_service.mutate_account_budget_proposal(
+                    customer_id=customer_id,
+                    operation=op
+                )
+                proposal_resource = resp.result.resource_name
+                proposal_id = proposal_resource.split("/")[-1]
+                ended.append({
+                    "account_budget": b.resource_name,
+                    "account_budget_status": b.status.name,
+                    "end_proposal_resource": proposal_resource,
+                    "end_proposal_id": proposal_id,
+                })
+            except GoogleAdsException as e:
+                # Log but continue with other budgets
+                print("Failed to END budget:", b.resource_name)
+                for err in e.failure.errors:
+                    print("  Error:", err.message)
+
+        return jsonify({
+            "success": True,
+            "customer_id": customer_id,
+            "customer_name": name,
+            "customer_status": status,
+            "ended_budgets": ended,
+            "message": f"Customer is SUSPENDED. END proposals submitted for {len(ended)} active account budgets."
+        }), 200
+
+    except GoogleAdsException as e:
+        errs = [{"code": str(err.error_code), "message": err.message} for err in e.failure.errors]
+        return jsonify({"success": False, "errors": errs}), 400
+    except Exception as e:
+        return jsonify({"success": False, "errors": [str(e)]}), 500
+
+
 
 
 @app.route('/list-payments-accounts', methods=['GET'])
