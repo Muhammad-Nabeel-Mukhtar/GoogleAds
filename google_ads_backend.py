@@ -56,7 +56,7 @@ def index():
                 "List all client accounts currently linked under the MCC."
             ),
             "POST /assign-billing-setup": (
-                "Assign the MCC payments account as billing for an existing client account "
+                "Assign the MCC or child payments account as billing for an existing client account "
                 "using Google Ads BillingSetupService. Body: {customer_id}"
             ),
             "POST /update-email": (
@@ -64,9 +64,8 @@ def index():
                 "Body: {customer_id, email}"
             ),
             "POST /approve-topup": (
-                "Approve a topup and create an account budget (hard cap + soft cap) for the client. "
-                "Uses Google Ads AccountBudgetProposalService. "
-                "Body: {customer_id, topup_amount}"
+                "Approve a topup and create or update an invoiced account budget (hard cap) for the client "
+                "using AccountBudgetProposalService. Body: {customer_id, topup_amount}"
             ),
             "POST /check-and-pause-campaigns": (
                 "Check current spend against the configured soft cap and pause all active campaigns "
@@ -77,6 +76,34 @@ def index():
                 "and the last approved topup in our DB). "
                 "Query: ?customer_id=XXX. "
                 "Returns: {topup_amount, total_spend, remaining_balance, percentage_used}"
+            ),
+            "GET /list-payments-accounts": (
+                "List payments accounts visible to a given customer (MCC or child) via PaymentsAccountService. "
+                "Query: ?customer_id=XXX"
+            ),
+            "GET /debug-mcc-billing-setups": (
+                "Debug endpoint that runs a billing_setup query at MCC level to show manager-level "
+                "payments accounts and billing setups."
+            ),
+            "GET /debug-billing-status": (
+                "Debug endpoint to list billing setups and their statuses for a specific customer. "
+                "Query: ?customer_id=XXX"
+            ),
+            "POST /approve-topup-legacy": (
+                "Legacy soft-cap-only topup handler (if still deployed). "
+                "Body: {customer_id, topup_amount}"
+            ),
+            "POST /end-account-budget": (
+                "End a single active account budget for a client using an END AccountBudgetProposal. "
+                "Body: {customer_id}"
+            ),
+            "POST /end-all-budgets-if-suspended": (
+                "If the customer is SUSPENDED, submit END proposals for all active account budgets. "
+                "Body: {customer_id}"
+            ),
+            "GET /check-user-invite-status": (
+                "Check whether a user invitation to a Google Ads account is still pending or already accepted. "
+                "Query: ?customer_id=XXX&email=user@example.com"
             )
         }
     })
