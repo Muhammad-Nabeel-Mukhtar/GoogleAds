@@ -257,8 +257,8 @@ def end_all_budgets():
 
     Flow:
     - Fetch customer basic info (for context only).
-    - Find all active account_budgets.
-    - Submit END proposals for each active account budget, regardless of suspension status.
+    - Find all non-ended account_budgets.
+    - Submit END proposals for each such account budget, regardless of suspension status.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -274,7 +274,7 @@ def end_all_budgets():
         # Optional: fetch customer status/name for context in response
         status, name = _get_customer_status(client, customer_id)
 
-        # 1) Find all "active" account budgets (tune statuses as needed)
+        # 1) Get all account budgets and log their statuses
         budget_query = """
             SELECT
               account_budget.id,
@@ -287,7 +287,16 @@ def end_all_budgets():
         budgets = []
         for row in ga_service.search(customer_id=customer_id, query=budget_query):
             b = row.account_budget
-            if b.status.name in ("APPROVED", "PENDING", "PROPOSED"):
+            print(
+                "[DEBUG BUDGET]",
+                "id:", b.id,
+                "resource_name:", b.resource_name,
+                "status:", b.status.name,
+                "approved_spending_limit_micros:", b.approved_spending_limit_micros,
+            )
+
+            # Consider everything except ENDED / CANCELLED as eligible to END
+            if b.status.name not in ("ENDED", "CANCELLED"):
                 budgets.append(b)
 
         if not budgets:
@@ -297,7 +306,7 @@ def end_all_budgets():
                 "customer_name": name,
                 "customer_status": status,
                 "ended_budgets": [],
-                "message": "No active account budgets were found to END."
+                "message": "No account budgets were found that can be ended (all are already ENDED/CANCELLED)."
             }), 200
 
         ended = []
@@ -308,9 +317,7 @@ def end_all_budgets():
 
             proposal.proposal_type = proposal_type_enum.END
             proposal.account_budget = b.resource_name
-            proposal.proposed_notes = (
-                "Ended via /end-all-budgets endpoint."
-            )
+            proposal.proposed_notes = "Ended via /end-all-budgets endpoint."
 
             try:
                 resp = proposal_service.mutate_account_budget_proposal(
@@ -326,7 +333,6 @@ def end_all_budgets():
                     "end_proposal_id": proposal_id,
                 })
             except GoogleAdsException as e:
-                # Log but continue with other budgets
                 print("Failed to END budget:", b.resource_name)
                 for err in e.failure.errors:
                     print("  Error:", err.message)
@@ -337,7 +343,7 @@ def end_all_budgets():
             "customer_name": name,
             "customer_status": status,
             "ended_budgets": ended,
-            "message": f"END proposals submitted for {len(ended)} active account budgets."
+            "message": f"END proposals submitted for {len(ended)} account budgets."
         }), 200
 
     except GoogleAdsException as e:
@@ -345,6 +351,7 @@ def end_all_budgets():
         return jsonify({"success": False, "errors": errs}), 400
     except Exception as e:
         return jsonify({"success": False, "errors": [str(e)]}), 500
+
 
 
 
