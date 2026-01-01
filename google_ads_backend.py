@@ -256,8 +256,9 @@ def end_all_budgets():
     }
 
     Flow:
-    - Find all account_budgets (including their billing_setup link).
-    - Submit END proposals for each non-ended account budget, regardless of suspension status.
+    - Find all non-ended account_budgets.
+    - Submit END proposals for each, regardless of suspension status.
+    - Note: do NOT include proposed_notes for END proposal type (immutable field error).
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -270,11 +271,24 @@ def end_all_budgets():
         ga_service = client.get_service("GoogleAdsService")
         proposal_service = client.get_service("AccountBudgetProposalService")
 
-        # Optional: fetch customer status/name for context in response
-        status, name = _get_customer_status(client, customer_id)
+        # 1) Block suspended / canceled / closed customers
+        ok, status, name = ensure_customer_active(client, customer_id)
+        if not ok:
+            return jsonify({
+                "success": False,
+                "errors": [
+                    f"Customer {customer_id} ({name}) has status {status}. "
+                    "Cannot end budgets for non-ENABLED accounts."
+                ],
+                "customer_status": status,
+            }), 400
 
-        # 1) Query account budgets WITH billing_setup link
-        # This is key: we need to see which billing setup each budget is tied to
+        print("\n[END_BUDGETS] Starting...")
+        print(f"[END_BUDGETS] Customer ID: {customer_id}")
+        print(f"[END_BUDGETS] Customer Name: {name}")
+        print(f"[END_BUDGETS] Customer Status: {status}")
+
+        # 2) Query all account budgets
         budget_query = """
             SELECT
               account_budget.id,
@@ -289,7 +303,7 @@ def end_all_budgets():
         """
         budgets = []
         all_budgets_found = []
-        
+
         for row in ga_service.search(customer_id=customer_id, query=budget_query):
             b = row.account_budget
             all_budgets_found.append({
@@ -297,13 +311,11 @@ def end_all_budgets():
                 "resource_name": b.resource_name,
                 "status": b.status.name,
                 "billing_setup": b.billing_setup,
+                "approved_spending_limit_micros": b.approved_spending_limit_micros,
             })
             print(
-                "[DEBUG BUDGET]",
-                "id:", b.id,
-                "resource_name:", b.resource_name,
-                "status:", b.status.name,
-                "billing_setup:", b.billing_setup,
+                f"[END_BUDGETS] Found budget: id={b.id}, status={b.status.name}, "
+                f"billing_setup={b.billing_setup}"
             )
 
             # Consider everything except ENDED / CANCELLED as eligible to END
@@ -318,12 +330,13 @@ def end_all_budgets():
                 "customer_status": status,
                 "all_budgets_found": all_budgets_found,
                 "ended_budgets": [],
-                "message": f"No account budgets were found that can be ended (all are already ENDED/CANCELLED). Total budgets queried: {len(all_budgets_found)}"
+                "message": f"No active account budgets to end. Total found: {len(all_budgets_found)}"
             }), 200
 
+        # 3) Submit END proposals for each active budget
         ended = []
         failed = []
-        
+
         for b in budgets:
             op = client.get_type("AccountBudgetProposalOperation")
             proposal = op.create
@@ -331,7 +344,8 @@ def end_all_budgets():
 
             proposal.proposal_type = proposal_type_enum.END
             proposal.account_budget = b.resource_name
-            proposal.proposed_notes = "Ended via /end-all-budgets endpoint."
+            # NOTE: Do NOT set proposed_notes for END proposal type
+            # It causes immutable_field error
 
             try:
                 resp = proposal_service.mutate_account_budget_proposal(
@@ -341,25 +355,25 @@ def end_all_budgets():
                 proposal_resource = resp.result.resource_name
                 proposal_id = proposal_resource.split("/")[-1]
                 ended.append({
-                    "account_budget": b.resource_name,
                     "account_budget_id": b.id,
+                    "account_budget": b.resource_name,
                     "account_budget_status": b.status.name,
                     "billing_setup": b.billing_setup,
                     "end_proposal_resource": proposal_resource,
                     "end_proposal_id": proposal_id,
                 })
-                print("[END SUCCESS] Budget:", b.resource_name, "Proposal:", proposal_resource)
-                
+                print(f"[END_BUDGETS] SUCCESS: Budget {b.id} ended. Proposal: {proposal_resource}")
+
             except GoogleAdsException as e:
-                print("Failed to END budget:", b.resource_name)
                 error_list = []
                 for err in e.failure.errors:
-                    print("  Error:", str(err.error_code), "-", err.message)
                     error_list.append({
                         "error_code": str(err.error_code),
                         "message": err.message
                     })
+                    print(f"[END_BUDGETS] Error on budget {b.id}: {err.message}")
                 failed.append({
+                    "account_budget_id": b.id,
                     "account_budget": b.resource_name,
                     "errors": error_list
                 })
@@ -372,14 +386,25 @@ def end_all_budgets():
             "all_budgets_found": all_budgets_found,
             "ended_budgets": ended,
             "failed_to_end": failed,
-            "message": f"END proposals submitted for {len(ended)} account budgets. {len(failed)} failed."
+            "message": (
+                f"END proposals submitted for {len(ended)} active budgets. "
+                f"{len(failed)} failed."
+            ),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
         }), 200
 
     except GoogleAdsException as e:
-        errs = [{"code": str(err.error_code), "message": err.message} for err in e.failure.errors]
-        return jsonify({"success": False, "errors": errs}), 400
+        error_details = []
+        for err in e.failure.errors:
+            error_details.append({
+                "error_code": str(err.error_code),
+                "message": err.message
+            })
+        print(f"[END_BUDGETS] GoogleAdsException: {error_details}")
+        return jsonify({"success": False, "errors": error_details}), 400
+
     except Exception as e:
-        print("[EXCEPTION]", str(e))
+        print(f"[END_BUDGETS] Exception: {str(e)}")
         return jsonify({"success": False, "errors": [str(e)]}), 500
 
 
