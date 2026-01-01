@@ -274,7 +274,7 @@ def end_all_budgets():
         status, name = _get_customer_status(client, customer_id)
 
         # 1) Query account budgets WITH billing_setup link
-        # This is key: we need to see which billing setup each budget is tied to [web:140][web:57]
+        # This is key: we need to see which billing setup each budget is tied to
         budget_query = """
             SELECT
               account_budget.id,
@@ -354,7 +354,7 @@ def end_all_budgets():
                 print("Failed to END budget:", b.resource_name)
                 error_list = []
                 for err in e.failure.errors:
-                    print("  Error:", err.error_code.name, "-", err.message)
+                    print("  Error:", str(err.error_code), "-", err.message)
                     error_list.append({
                         "error_code": str(err.error_code),
                         "message": err.message
