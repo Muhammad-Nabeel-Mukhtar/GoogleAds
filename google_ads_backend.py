@@ -256,9 +256,8 @@ def end_all_budgets():
     }
 
     Flow:
-    - Fetch customer basic info (for context only).
-    - Find all non-ended account_budgets.
-    - Submit END proposals for each such account budget, regardless of suspension status.
+    - Find all account_budgets (including their billing_setup link).
+    - Submit END proposals for each non-ended account budget, regardless of suspension status.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -274,25 +273,37 @@ def end_all_budgets():
         # Optional: fetch customer status/name for context in response
         status, name = _get_customer_status(client, customer_id)
 
-        # 1) Get all account budgets and log their statuses
+        # 1) Query account budgets WITH billing_setup link
+        # This is key: we need to see which billing setup each budget is tied to [web:140][web:57]
         budget_query = """
             SELECT
               account_budget.id,
               account_budget.resource_name,
               account_budget.status,
-              account_budget.approved_spending_limit_micros
+              account_budget.billing_setup,
+              account_budget.approved_spending_limit_micros,
+              account_budget.approved_start_date_time,
+              account_budget.approved_end_date_time
             FROM account_budget
             ORDER BY account_budget.id
         """
         budgets = []
+        all_budgets_found = []
+        
         for row in ga_service.search(customer_id=customer_id, query=budget_query):
             b = row.account_budget
+            all_budgets_found.append({
+                "id": b.id,
+                "resource_name": b.resource_name,
+                "status": b.status.name,
+                "billing_setup": b.billing_setup,
+            })
             print(
                 "[DEBUG BUDGET]",
                 "id:", b.id,
                 "resource_name:", b.resource_name,
                 "status:", b.status.name,
-                "approved_spending_limit_micros:", b.approved_spending_limit_micros,
+                "billing_setup:", b.billing_setup,
             )
 
             # Consider everything except ENDED / CANCELLED as eligible to END
@@ -305,11 +316,14 @@ def end_all_budgets():
                 "customer_id": customer_id,
                 "customer_name": name,
                 "customer_status": status,
+                "all_budgets_found": all_budgets_found,
                 "ended_budgets": [],
-                "message": "No account budgets were found that can be ended (all are already ENDED/CANCELLED)."
+                "message": f"No account budgets were found that can be ended (all are already ENDED/CANCELLED). Total budgets queried: {len(all_budgets_found)}"
             }), 200
 
         ended = []
+        failed = []
+        
         for b in budgets:
             op = client.get_type("AccountBudgetProposalOperation")
             proposal = op.create
@@ -328,30 +342,45 @@ def end_all_budgets():
                 proposal_id = proposal_resource.split("/")[-1]
                 ended.append({
                     "account_budget": b.resource_name,
+                    "account_budget_id": b.id,
                     "account_budget_status": b.status.name,
+                    "billing_setup": b.billing_setup,
                     "end_proposal_resource": proposal_resource,
                     "end_proposal_id": proposal_id,
                 })
+                print("[END SUCCESS] Budget:", b.resource_name, "Proposal:", proposal_resource)
+                
             except GoogleAdsException as e:
                 print("Failed to END budget:", b.resource_name)
+                error_list = []
                 for err in e.failure.errors:
-                    print("  Error:", err.message)
+                    print("  Error:", err.error_code.name, "-", err.message)
+                    error_list.append({
+                        "error_code": str(err.error_code),
+                        "message": err.message
+                    })
+                failed.append({
+                    "account_budget": b.resource_name,
+                    "errors": error_list
+                })
 
         return jsonify({
             "success": True,
             "customer_id": customer_id,
             "customer_name": name,
             "customer_status": status,
+            "all_budgets_found": all_budgets_found,
             "ended_budgets": ended,
-            "message": f"END proposals submitted for {len(ended)} account budgets."
+            "failed_to_end": failed,
+            "message": f"END proposals submitted for {len(ended)} account budgets. {len(failed)} failed."
         }), 200
 
     except GoogleAdsException as e:
         errs = [{"code": str(err.error_code), "message": err.message} for err in e.failure.errors]
         return jsonify({"success": False, "errors": errs}), 400
     except Exception as e:
+        print("[EXCEPTION]", str(e))
         return jsonify({"success": False, "errors": [str(e)]}), 500
-
 
 
 
