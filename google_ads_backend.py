@@ -245,10 +245,10 @@ def _get_customer_status(client, customer_id: str):
     return None, None
 
 
-@app.route('/end-all-budgets-if-suspended', methods=['POST'])
-def end_all_budgets_if_suspended():
+@app.route('/end-all-budgets', methods=['POST'])
+def end_all_budgets():
     """
-    POST /end-all-budgets-if-suspended
+    POST /end-all-budgets
 
     Body:
     {
@@ -256,9 +256,9 @@ def end_all_budgets_if_suspended():
     }
 
     Flow:
-    - Check customer.status.
-    - If not SUSPENDED -> return, no changes.
-    - If SUSPENDED -> find all active account_budgets and submit END proposals.
+    - Fetch customer basic info (for context only).
+    - Find all active account_budgets.
+    - Submit END proposals for each active account budget, regardless of suspension status.
     """
     data = request.json or {}
     customer_id = str(data.get('customer_id', '')).strip()
@@ -271,20 +271,10 @@ def end_all_budgets_if_suspended():
         ga_service = client.get_service("GoogleAdsService")
         proposal_service = client.get_service("AccountBudgetProposalService")
 
-        # 1) Check customer status
+        # Optional: fetch customer status/name for context in response
         status, name = _get_customer_status(client, customer_id)
-        if not status:
-            return jsonify({"success": False, "errors": ["Unable to fetch customer status."]}), 400
 
-        if status != "SUSPENDED":
-            return jsonify({
-                "success": False,
-                "errors": [f"Customer status is {status}, not SUSPENDED. No budget changes made."],
-                "customer_id": customer_id,
-                "customer_name": name
-            }), 400
-
-        # 2) Find all "active" account budgets (tune statuses as needed)
+        # 1) Find all "active" account budgets (tune statuses as needed)
         budget_query = """
             SELECT
               account_budget.id,
@@ -307,7 +297,7 @@ def end_all_budgets_if_suspended():
                 "customer_name": name,
                 "customer_status": status,
                 "ended_budgets": [],
-                "message": "Customer is SUSPENDED but no active account budgets were found."
+                "message": "No active account budgets were found to END."
             }), 200
 
         ended = []
@@ -319,7 +309,7 @@ def end_all_budgets_if_suspended():
             proposal.proposal_type = proposal_type_enum.END
             proposal.account_budget = b.resource_name
             proposal.proposed_notes = (
-                "Ended via /end-all-budgets-if-suspended because customer status is SUSPENDED."
+                "Ended via /end-all-budgets endpoint."
             )
 
             try:
@@ -347,7 +337,7 @@ def end_all_budgets_if_suspended():
             "customer_name": name,
             "customer_status": status,
             "ended_budgets": ended,
-            "message": f"Customer is SUSPENDED. END proposals submitted for {len(ended)} active account budgets."
+            "message": f"END proposals submitted for {len(ended)} active account budgets."
         }), 200
 
     except GoogleAdsException as e:
