@@ -1,6 +1,8 @@
 # Ignore sensitive config and environment files
 config/google-ads.yaml
+config/photonpay.yaml
 *.pyc
 __pycache__/
 venv/
 .env
+

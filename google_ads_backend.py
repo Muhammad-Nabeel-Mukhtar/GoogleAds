@@ -8,6 +8,9 @@ import re
 import os
 from datetime import datetime
 import logging
+
+import yaml
+from app.payments import payments_bp
 import sys
 
 logger = logging.getLogger('google.ads.googleads.client')
@@ -16,7 +19,32 @@ logger.setLevel(logging.DEBUG)  # or INFO
 
 
 app = Flask(__name__)
+
 CORS(app)
+
+def load_photonpay_config() -> None:
+    """
+    Load config/photonpay.yaml into app.config["PHOTONPAY_CONFIG"].
+    """
+    root = Path(__file__).resolve().parent  # project root (folder with google_ads_backend.py)
+    config_path = root / "config" / "photonpay.yaml"
+
+    if not config_path.exists():
+        # In dev we can skip; in prod you may want to raise
+        print(f"[WARN] PhotonPay config file not found: {config_path}")
+        app.config["PHOTONPAY_CONFIG"] = {}
+        return
+
+    with config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    app.config["PHOTONPAY_CONFIG"] = data
+
+# Call it once at startup
+load_photonpay_config()
+
+# Register payments blueprint (all /api/payments* and webhook routes)
+app.register_blueprint(payments_bp)
 
 GOOGLE_ADS_CONFIG_PATH = os.getenv("GOOGLE_ADS_CONFIG_PATH", "google-ads.yaml")
 
@@ -1733,4 +1761,5 @@ def client_spend_status():
 
 
 if __name__ == '__main__':
+    
     app.run(host='0.0.0.0', port=8080, debug=False)
