@@ -9,7 +9,7 @@ from flask import jsonify, request, current_app
 
 from . import payments_bp
 from .models import payment_store
-from .photonpay_client import PhotonPayClient
+from .leptage_client import LeptageClient
 
 
 def _now_iso() -> str:
@@ -25,16 +25,16 @@ def create_payment():
     {
       "customer_id": "1234567890",
       "amount": 1000,
-      "currency": "USD"  # optional, default comes from YAML
+      "currency": "USDT"  # optional, default comes from YAML
     }
     """
     data = request.get_json(silent=True) or {}
     customer_id = str(data.get("customer_id", "")).strip()
     amount_raw = data.get("amount")
 
-    cfg = current_app.config.get("PHOTONPAY_CONFIG", {})
+    cfg = current_app.config.get("LEPTAGE_CONFIG", {})
     payments_cfg = cfg.get("payments", {})
-    default_currency = payments_cfg.get("currency_default", "USD")
+    default_currency = payments_cfg.get("currency_default", "USDT")
 
     currency = str(data.get("currency", default_currency)).strip().upper()
 
@@ -56,7 +56,7 @@ def create_payment():
     success_path = payments_cfg.get("success_path", "/payment-success")
     return_url = request.host_url.rstrip("/") + success_path
 
-    client = PhotonPayClient()
+    client = LeptageClient()
     payment_resp = client.create_payment(
         customer_id=customer_id,
         amount=amount,
@@ -64,8 +64,9 @@ def create_payment():
         return_url=return_url,
     )
 
+    # Here, payment_resp["id"] is Leptage's id or stub id
     record = payment_store.create_payment(
-        photonpay_id=payment_resp["id"],
+        gateway_id=payment_resp["id"],
         customer_id=customer_id,
         amount=amount,
         currency=currency,
@@ -107,24 +108,35 @@ def get_payment_status(payment_id: str):
     ), 200
 
 
-@payments_bp.route("/webhooks/photonpay", methods=["POST"])
-def photonpay_webhook():
+@payments_bp.route("/webhooks/leptage", methods=["POST"])
+def leptage_webhook():
     """
-    POST /api/webhooks/photonpay
+    POST /api/webhooks/leptage
 
-    For now: log + update local state.
-    Later: add signature verification using PhotonPayClient.verify_webhook_signature.
+    For now:
+      - log + update local state by gateway_id.
+      - later: use LeptageClient.verify_webhook_signature + real payload mapping.
     """
+    raw_body = request.get_data()
+    signature = request.headers.get("X-Leptage-Signature", "")
+
+    client = LeptageClient()
+    if not client.verify_webhook_signature(raw_body, signature):
+        # For dev you might still return 200, but in prod consider 401
+        print("[LEPTAGE WEBHOOK] Invalid signature")
+        # return jsonify({"success": False, "error": "Invalid signature"}), 401
+
     payload = request.get_json(silent=True) or {}
     event = payload.get("event")
     data = payload.get("data") or {}
 
-    photonpay_id = data.get("id")
+    # Adjust keys once you know Leptage's exact payload.
+    gateway_id = data.get("transaction_id") or data.get("id")
     status = data.get("status")
 
-    print(f"[PHOTONPAY WEBHOOK] event={event}, id={photonpay_id}, status={status}")
+    print(f"[LEPTAGE WEBHOOK] event={event}, id={gateway_id}, status={status}")
 
-    if photonpay_id and status:
-        payment_store.update_status(photonpay_id, status)
+    if gateway_id and status:
+        payment_store.update_status(gateway_id, status.upper())
 
     return jsonify({"success": True}), 200

@@ -11,8 +11,8 @@ import logging
 from pathlib import Path
 
 
-
 import yaml
+from pathlib import Path
 from app.payments import payments_bp
 import sys
 
@@ -25,26 +25,26 @@ app = Flask(__name__)
 
 CORS(app)
 
-def load_photonpay_config() -> None:
+def load_leptage_config() -> None:
     """
-    Load config/photonpay.yaml into app.config["PHOTONPAY_CONFIG"].
+    Load config/leptage.yaml into app.config["LEPTAGE_CONFIG"].
     """
     root = Path(__file__).resolve().parent  # project root (folder with google_ads_backend.py)
-    config_path = root / "config" / "photonpay.yaml"
+    config_path = root / "config" / "leptage.yaml"
 
     if not config_path.exists():
-        # In dev we can skip; in prod you may want to raise
-        print(f"[WARN] PhotonPay config file not found: {config_path}")
-        app.config["PHOTONPAY_CONFIG"] = {}
+        print(f"[WARN] Leptage config file not found: {config_path}")
+        app.config["LEPTAGE_CONFIG"] = {}
         return
 
     with config_path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
-    app.config["PHOTONPAY_CONFIG"] = data
+    app.config["LEPTAGE_CONFIG"] = data
+
 
 # Call it once at startup
-load_photonpay_config()
+load_leptage_config()
 
 # Register payments blueprint (all /api/payments* and webhook routes)
 app.register_blueprint(payments_bp)

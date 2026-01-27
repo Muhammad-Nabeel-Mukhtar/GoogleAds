@@ -1,0 +1,29 @@
+# config/leptage.yaml
+
+leptage:
+  # Which environment to use: "uat" (test) or "production"
+  env: "uat"
+
+  # Base URLs for each environment (from Leptage docs)
+  base_urls:
+    uat: "https://api1.uat.planckage.cc/openapi"
+    production: "https://api.leptage.com/openapi"
+
+  # Leptage webhook source IPs (for your firewall / reference)
+  ip_whitelist:
+    uat: "8.211.41.3"
+    production: "8.211.21.244"
+
+  # NOTE: Do NOT put real secrets here.
+  # api_key, api_secret, webhook_secret, private_key
+  # should be loaded from environment variables (.env).
+
+payments:
+  # Default currency for customer topups
+  currency_default: "USDT"
+
+  # (Optional) default chain if you later add chain support
+  chain_default: "ethereum"
+
+  # Frontend success redirect path after payment
+  success_path: "/payment-success"
