@@ -10,6 +10,7 @@ from flask import jsonify, request, current_app
 from . import payments_bp
 from .models import payment_store
 from .leptage_client import LeptageClient
+from .leptage_signing import get_webhook_verifier
 
 
 def _now_iso() -> str:
@@ -113,30 +114,27 @@ def leptage_webhook():
     """
     POST /api/webhooks/leptage
 
-    For now:
-      - log + update local state by gateway_id.
-      - later: use LeptageClient.verify_webhook_signature + real payload mapping.
+    Verifies Leptage webhook using HMAC-SHA256 as per docs, then updates state.
     """
     raw_body = request.get_data()
-    signature = request.headers.get("X-Leptage-Signature", "")
+    headers = request.headers
 
-    client = LeptageClient()
-    if not client.verify_webhook_signature(raw_body, signature):
-        # For dev you might still return 200, but in prod consider 401
+    verifier = get_webhook_verifier()
+    if not verifier.verify_webhook(headers, raw_body):
         print("[LEPTAGE WEBHOOK] Invalid signature")
-        # return jsonify({"success": False, "error": "Invalid signature"}), 401
+        return jsonify({"success": False, "error": "Invalid signature"}), 401
 
     payload = request.get_json(silent=True) or {}
     event = payload.get("event")
     data = payload.get("data") or {}
 
-    # Adjust keys once you know Leptage's exact payload.
+    # Adjust mapping once you know Leptage's exact webhook payload schema.
     gateway_id = data.get("transaction_id") or data.get("id")
     status = data.get("status")
 
     print(f"[LEPTAGE WEBHOOK] event={event}, id={gateway_id}, status={status}")
 
     if gateway_id and status:
-        payment_store.update_status(gateway_id, status.upper())
+        payment_store.update_status(gateway_id, str(status).upper())
 
     return jsonify({"success": True}), 200

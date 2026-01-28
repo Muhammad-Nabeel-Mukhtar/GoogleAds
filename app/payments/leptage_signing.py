@@ -1,9 +1,34 @@
 # app/payments/leptage_signing.py
 """
-Leptage API request signing using EC secp256r1 + SHA256 ECDSA.
+Leptage API request signing and webhook verification.
 
-This module handles all cryptographic operations for signing Leptage API requests.
-Follows the pattern from their Java example using secp256r1 elliptic curve.
+API Authentication:
+- ECDSA P-256 (secp256r1, prime256v1) with SHA256withECDSA
+- Headers:
+    X-API-KEY      : Public Key (API Key, hex DER)
+    X-API-SIGNATURE: Signature (hex DER)
+    X-API-NONCE    : Timestamp in ms
+- String to sign:
+    METHOD + /openapi + PATH + NONCE + PARAMS
+  where:
+    - METHOD is uppercased (GET/POST/...)
+    - PATH is resource path WITHOUT /openapi (e.g. /v1/balance)
+    - NONCE is X-API-NONCE (ms)
+    - PARAMS:
+        * GET:  key=val&key2=val2 (sorted by key, asc)
+        * POST: compact JSON (no spaces/newlines)
+        * None: empty string
+
+Webhook Authentication:
+- HMAC-SHA256 using Webhook Secret
+- Headers:
+    X-HOOK-SIGNATURE: Signature (hex)
+    X-HOOK-NONCE    : Timestamp in ms
+- String to sign:
+    NONCE + WEBHOOK_URL + PARAMS
+  where:
+    - WEBHOOK_URL is the full callback URL you registered
+    - PARAMS is compact JSON body (no spaces/newlines)
 """
 
 import hashlib
@@ -15,16 +40,18 @@ import hmac
 from typing import Dict, Any, Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, utils
-import base64
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 class LeptageRequestSigner:
     """
-    Signs Leptage API requests using ECDSA secp256r1 + SHA256.
+    Signs Leptage API requests using ECDSA P-256 (secp256r1) + SHA256.
 
-    Leptage uses EC key pairs (secp256r1) to sign all API requests.
-    This ensures request authenticity and integrity.
+    Spec:
+      - X-API-KEY      : public key hex (API Key)
+      - X-API-NONCE    : timestamp in ms
+      - X-API-SIGNATURE: ECDSA signature over:
+            METHOD + "/openapi" + PATH + NONCE + PARAMS
     """
 
     def __init__(self, api_key_hex: str, api_secret_hex: str):
@@ -32,7 +59,7 @@ class LeptageRequestSigner:
         Initialize signer with hex-encoded EC keys.
 
         Args:
-            api_key_hex: Public key as hex string (from generate_leptage_keys.py)
+            api_key_hex   : Public key as hex string (from generate_leptage_keys.py)
             api_secret_hex: Private key as hex string (from generate_leptage_keys.py)
 
         Raises:
@@ -41,7 +68,6 @@ class LeptageRequestSigner:
         self.api_key_hex = api_key_hex
         self.api_secret_hex = api_secret_hex
 
-        # Reconstruct private key from DER hex bytes
         try:
             private_der = binascii.unhexlify(api_secret_hex)
             self.private_key = serialization.load_der_private_key(
@@ -50,182 +76,190 @@ class LeptageRequestSigner:
         except Exception as e:
             raise RuntimeError(f"[LEPTAGE] Failed to load private key from hex: {e}")
 
+    def _build_params_string(
+        self,
+        method: str,
+        body_or_params: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Build the 'request parameters' string as per docs.
+
+        GET:
+            name=someone&age=21  -> sorted by key -> age=21&name=someone
+        POST:
+            {"name": "someone", "age": 21}
+            -> {"name":"someone","age":21} (compact JSON)
+        None:
+            ""
+        """
+        if not body_or_params:
+            return ""
+
+        method_up = method.upper()
+
+        if method_up == "GET":
+            items = sorted(body_or_params.items(), key=lambda x: x[0])
+            return "&".join(f"{k}={v}" for k, v in items)
+
+        # POST JSON (and others treated as JSON)
+        json_str = json.dumps(body_or_params, separators=(",", ":"), sort_keys=True)
+        return json_str
+
+    def _build_string_to_sign(
+        self,
+        method: str,
+        path: str,
+        nonce_ms: int,
+        body_or_params: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Construct string:
+            METHOD + /openapi + PATH + NONCE + PARAMS
+
+        Examples from docs:
+
+          GET:
+            Request params: name=someone&age=21 -> age=21&name=someone
+            Method        : GET
+            Path          : /v1/balance
+            Nonce         : 1741240848495
+
+            String:
+              GET/openapi/v1/balance1741240848495age=21&name=someone
+
+          POST:
+            Request params: {"name":"someone","age":21}
+            Method        : POST
+            Path          : /v1/balance
+            Nonce         : 1741240918899
+
+            String:
+              POST/openapi/v1/balance1741240918899{"name":"someone","age":21}
+        """
+        method_up = method.upper()
+        params_str = self._build_params_string(method_up, body_or_params)
+
+        if not path.startswith("/"):
+            path = "/" + path
+
+        resource = f"/openapi{path}"
+        return f"{method_up}{resource}{nonce_ms}{params_str}"
+
+    def _sign_bytes(self, data: bytes) -> str:
+        """
+        Sign bytes with ECDSA P-256 + SHA256 and return DER hex string.
+        """
+        signature_der = self.private_key.sign(
+            data,
+            ec.ECDSA(hashes.SHA256()),
+        )
+        return binascii.hexlify(signature_der).decode()
+
     def sign_request(
         self,
         method: str,
         path: str,
-        body: Optional[Dict[str, Any]] = None,
-        timestamp: Optional[int] = None,
+        body_or_params: Optional[Dict[str, Any]] = None,
+        nonce_ms: Optional[int] = None,
     ) -> Dict[str, str]:
         """
-        Create signed request headers for Leptage API.
-
-        This generates:
-        - X-API-Key: Your public key (hex)
-        - X-Signature: ECDSA signature of the request (hex)
-        - X-Timestamp: Request timestamp for replay protection
-        - Content-Type: application/json
+        Create signed headers for a Leptage API request.
 
         Args:
-            method: HTTP method (GET, POST, etc.)
-            path: API endpoint path (e.g. /v1/address/deposit)
-            body: Request body dict (if POST/PUT)
-            timestamp: Unix timestamp (auto-generated if not provided)
+            method       : HTTP method ("GET", "POST", ...)
+            path         : resource path WITHOUT /openapi prefix
+                           e.g. "/v1/balance", "/v1/address/deposit"
+            body_or_params: dict of GET query params or POST JSON body
+            nonce_ms     : timestamp in ms (if None, auto-generate)
 
         Returns:
-            Dict of headers to include in HTTP request
-
-        Example:
-            headers = signer.sign_request("POST", "/v1/address/deposit", {"chain": "ethereum"})
-            # headers = {
-            #     "X-API-Key": "3059...",
-            #     "X-Signature": "3081...",
-            #     "X-Timestamp": "1234567890",
-            #     "Content-Type": "application/json"
-            # }
+            Headers dict with X-API-KEY, X-API-NONCE, X-API-SIGNATURE
         """
-        if timestamp is None:
-            timestamp = int(time.time())
+        if nonce_ms is None:
+            nonce_ms = int(time.time() * 1000)
 
-        # Build message to sign
-        # Standard pattern: METHOD|PATH|TIMESTAMP|BODY_HASH
-        if body:
-            # Sort keys for consistent JSON representation
-            body_str = json.dumps(body, separators=(",", ":"), sort_keys=True)
-            body_hash = hashlib.sha256(body_str.encode()).hexdigest()
-        else:
-            body_hash = hashlib.sha256(b"").hexdigest()
+        string_to_sign = self._build_string_to_sign(
+            method,
+            path,
+            nonce_ms,
+            body_or_params,
+        )
+        signature_hex = self._sign_bytes(string_to_sign.encode("utf-8"))
 
-        # Construct the message (adjust format if Leptage specifies different pattern)
-        message = f"{method}|{path}|{timestamp}|{body_hash}"
-
-        # Sign the message
-        signature_bytes = self._sign_message(message.encode())
-        signature_hex = binascii.hexlify(signature_bytes).decode()
-
-        # Return signed headers
         return {
-            "X-API-Key": self.api_key_hex,
-            "X-Signature": signature_hex,
-            "X-Timestamp": str(timestamp),
+            "X-API-KEY": self.api_key_hex,
+            "X-API-NONCE": str(nonce_ms),
+            "X-API-SIGNATURE": signature_hex,
             "Content-Type": "application/json",
         }
-
-    def _sign_message(self, message: bytes) -> bytes:
-        """
-        Sign a message using ECDSA secp256r1 + SHA256.
-
-        Args:
-            message: Raw message bytes to sign
-
-        Returns:
-            Raw signature bytes (DER-encoded by default)
-
-        Note:
-            If Leptage requires raw (r, s) format instead of DER, this can be
-            converted using utils.decode_dss_signature() and re-encoded.
-        """
-        try:
-            signature_der = self.private_key.sign(
-                message, ec.ECDSA(hashes.SHA256())
-            )
-            return signature_der
-        except Exception as e:
-            raise RuntimeError(f"[LEPTAGE] Failed to sign message: {e}")
-
-    def verify_signature(self, message: bytes, signature: bytes) -> bool:
-        """
-        Verify a signature (used for testing or webhook verification).
-
-        Args:
-            message: Original message bytes
-            signature: Signature bytes to verify
-
-        Returns:
-            True if signature is valid, False otherwise
-        """
-        try:
-            public_key = self.private_key.public_key()
-            public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
-            return True
-        except Exception:
-            return False
 
 
 class LeptageWebhookVerifier:
     """
-    Verifies webhooks signed by Leptage.
+    Verify Leptage webhooks using HMAC-SHA256 as per docs.
 
-    Leptage sends webhooks with a signature header for verification.
+    Spec:
+      - X-HOOK-SIGNATURE: HMAC-SHA256 result (hex, case-insensitive)
+      - X-HOOK-NONCE    : timestamp in ms
+      - String to sign  : NONCE + WEBHOOK_URL + PARAMS
+            where PARAMS is compact JSON body (no spaces/newlines)
     """
 
-    def __init__(self, webhook_secret: str):
+    def __init__(self, webhook_secret: str, webhook_url: str):
         """
-        Initialize verifier with webhook secret.
-
         Args:
-            webhook_secret: Secret provided by Leptage for webhook HMAC
+            webhook_secret: Webhook Secret provided by Leptage
+            webhook_url   : Full webhook URL registered with Leptage
         """
-        self.webhook_secret = webhook_secret
+        self.webhook_secret = webhook_secret or ""
+        self.webhook_url = webhook_url
 
-    def verify_webhook(self, payload: bytes, signature: str) -> bool:
+    def _compact_body(self, body_bytes: bytes) -> str:
         """
-        Verify a webhook signature using HMAC-SHA256.
+        Remove spaces and newlines from JSON body as per docs.
+        """
+        text = body_bytes.decode("utf-8")
+        return text.replace(" ", "").replace("\n", "").replace("\r", "")
 
-        Args:
-            payload: Raw webhook payload bytes
-            signature: Signature from X-Leptage-Signature header (hex or base64)
+    def compute_signature(self, nonce: str, body_bytes: bytes) -> str:
+        """
+        Compute HMAC-SHA256 hex signature:
+            NONCE + WEBHOOK_URL + COMPACT_BODY
+        """
+        compact_body = self._compact_body(body_bytes)
+        to_sign = f"{nonce}{self.webhook_url}{compact_body}"
+        digest = hmac.new(
+            self.webhook_secret.encode("utf-8"),
+            to_sign.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return digest
 
-        Returns:
-            True if signature is valid, False otherwise
+    def verify_webhook(self, headers: Dict[str, str], body_bytes: bytes) -> bool:
+        """
+        Verify incoming webhook based on headers and raw body.
         """
         if not self.webhook_secret:
-            # If no secret configured, allow (for dev)
-            return True
-
-        try:
-            # Compute expected signature
-            expected = hmac.new(
-                self.webhook_secret.encode("utf-8"),
-                payload,
-                hashlib.sha256,
-            ).hexdigest()
-
-            # Compare (timing-safe)
-            return hmac.compare_digest(expected, signature or "")
-        except Exception as e:
-            print(f"[LEPTAGE WEBHOOK] Verification failed: {e}")
+            # No secret configured -> reject
             return False
+
+        nonce = headers.get("X-HOOK-NONCE") or headers.get("x-hook-nonce")
+        received_sig = headers.get("X-HOOK-SIGNATURE") or headers.get("x-hook-signature")
+
+        if not nonce or not received_sig:
+            return False
+
+        expected = self.compute_signature(str(nonce), body_bytes)
+        return hmac.compare_digest(expected.lower(), received_sig.lower())
 
 
 def get_signed_headers(
     method: str = "POST",
     path: str = "/",
-    body: Optional[Dict[str, Any]] = None,
+    body_or_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """
     Helper function to get signed headers for a Leptage API request.
-
-    Reads API credentials from environment and returns ready-to-use headers.
-
-    Args:
-        method: HTTP method
-        path: API endpoint path
-        body: Request body dict
-
-    Returns:
-        Headers dict ready for requests.post(url, json=body, headers=headers)
-
-    Raises:
-        RuntimeError: If credentials not configured in environment
-
-    Example:
-        headers = get_signed_headers("POST", "/v1/address/deposit", {"chain": "ethereum"})
-        response = requests.post(
-            "https://api1.uat.planckage.cc/openapi/v1/address/deposit",
-            json={"chain": "ethereum"},
-            headers=headers
-        )
     """
     api_key = os.getenv("LEPTAGE_API_KEY", "").strip()
     api_secret = os.getenv("LEPTAGE_API_SECRET", "").strip()
@@ -236,19 +270,14 @@ def get_signed_headers(
         )
 
     signer = LeptageRequestSigner(api_key, api_secret)
-    return signer.sign_request(method, path, body)
+    return signer.sign_request(method, path, body_or_params)
 
 
 def get_webhook_verifier() -> LeptageWebhookVerifier:
     """
-    Get a webhook verifier instance using credentials from environment.
-
-    Returns:
-        LeptageWebhookVerifier instance
-
-    Example:
-        verifier = get_webhook_verifier()
-        is_valid = verifier.verify_webhook(raw_body, signature_from_header)
+    Build a webhook verifier instance based on environment and known URL.
     """
-    webhook_secret = os.getenv("LEPTAGE_WEBHOOK_SECRET", "").strip() or None
-    return LeptageWebhookVerifier(webhook_secret or "")
+    webhook_secret = os.getenv("LEPTAGE_WEBHOOK_SECRET", "").strip()
+    # UAT webhook URL you registered with Leptage:
+    webhook_url = "https://googleads-ex2w.onrender.com/api/webhooks/leptage"
+    return LeptageWebhookVerifier(webhook_secret, webhook_url)

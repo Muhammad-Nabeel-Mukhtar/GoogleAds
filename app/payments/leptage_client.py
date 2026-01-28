@@ -24,11 +24,11 @@ class LeptageClient:
     """
     Leptage client wrapper with EC secp256r1 request signing.
 
-    Current behavior:
+    Behavior:
       - Reads non-secret config from app.config["LEPTAGE_CONFIG"] (YAML)
-      - Reads secrets (API key/secret, webhook_secret) from environment (.env)
-      - Automatically signs all API requests with ECDSA secp256r1 + SHA256
-      - create_payment uses a local stub until real API is wired
+      - Reads secrets (API key/secret, webhook_secret) from environment (.env / Render)
+      - Automatically signs all API requests as per Leptage docs
+      - create_payment currently uses a local stub until the real endpoint is finalized
     """
 
     def __init__(self) -> None:
@@ -43,7 +43,6 @@ class LeptageClient:
                 f"[LEPTAGE] Unknown environment or missing base_url for env={env_name}"
             )
 
-        # Secrets from environment (.env)
         api_key = os.getenv("LEPTAGE_API_KEY", "").strip()
         api_secret = os.getenv("LEPTAGE_API_SECRET", "").strip()
         webhook_secret = os.getenv("LEPTAGE_WEBHOOK_SECRET", "").strip() or None
@@ -56,7 +55,9 @@ class LeptageClient:
         )
 
     def is_configured(self) -> bool:
-        """Check if all required credentials are present."""
+        """
+        Check if all required credentials are present.
+        """
         s = self.settings
         return bool(s.base_url and s.api_key and s.api_secret)
 
@@ -72,25 +73,28 @@ class LeptageClient:
 
         For now:
           - if credentials missing -> stub
-          - if credentials present -> still stub until real API endpoint confirmed
+          - if credentials present -> still stub until real API endpoint is wired
         """
         if not self.is_configured():
             return self._create_payment_stub(
                 customer_id, amount, currency, return_url
             )
 
-        # TODO: Replace with real Leptage HTTP call (after API docs confirm endpoint)
+        # TODO: Replace with real Leptage HTTP call once the exact business API
+        #       endpoint and payload format are confirmed from docs.
         #
-        # Example (adjust based on actual Leptage API spec):
+        # Example (pseudo, adjust based on their business API docs):
+        #
+        # path = "/v1/address/deposit"   # WITHOUT /openapi
         # payload = {
         #     "amount": str(amount),
         #     "currency": currency,
         #     "customerId": customer_id,
         #     "returnUrl": return_url,
         # }
-        # headers = get_signed_headers("POST", "/v1/address/deposit", payload)
+        # headers = get_signed_headers("POST", path, payload)
         # resp = requests.post(
-        #     f"{self.settings.base_url}/v1/address/deposit",
+        #     f"{self.settings.base_url}{path}",
         #     json=payload,
         #     headers=headers,
         #     timeout=15,
@@ -111,7 +115,10 @@ class LeptageClient:
     ) -> Dict[str, Any]:
         from datetime import datetime, UTC
 
-        fake_payment_id = f"leptage-stub-{customer_id}-{int(datetime.now(UTC).timestamp())}"
+        fake_payment_id = (
+            f"leptage-stub-{customer_id}-"
+            f"{int(datetime.now(UTC).timestamp())}"
+        )
         fake_checkout_url = f"{return_url}?payment_id={fake_payment_id}"
 
         return {
@@ -122,7 +129,11 @@ class LeptageClient:
             "currency": currency,
         }
 
-    def verify_webhook_signature(self, payload: bytes, signature: str) -> bool:
-        """Verify a Leptage webhook signature."""
+    def verify_webhook_signature(self, headers, payload: bytes) -> bool:
+        """
+        Verify a Leptage webhook signature.
+
+        Note: This method is now a thin wrapper around LeptageWebhookVerifier.
+        """
         verifier = get_webhook_verifier()
-        return verifier.verify_webhook(payload, signature)
+        return verifier.verify_webhook(headers, payload)
