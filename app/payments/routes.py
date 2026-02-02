@@ -124,6 +124,7 @@ def get_payment_status(payment_id: str):
     ), 200
 
 
+
 @payments_bp.route("/webhooks/leptage", methods=["POST"])
 def leptage_webhook():
     """
@@ -207,3 +208,5 @@ def leptage_webhook():
         print(f"[LEPTAGE WEBHOOK] Status {status} not handled explicitly.")
 
     return jsonify({"success": True}), 200
+
+
