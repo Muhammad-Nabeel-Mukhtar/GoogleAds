@@ -9,7 +9,7 @@ import os
 from flask import current_app
 import requests
 
-from .leptage_signing import get_signed_headers, get_webhook_verifier
+from .leptage_signing import get_signed_headers_v2, get_webhook_verifier
 
 
 @dataclass
@@ -27,7 +27,7 @@ class LeptageClient:
     Behavior:
       - Reads non-secret config from app.config["LEPTAGE_CONFIG"] (YAML)
       - Reads secrets (API key/secret, webhook_secret) from environment (.env / Render)
-      - Automatically signs all API requests as per Leptage docs
+      - Automatically signs all API requests as per Leptage Java demo
       - create_payment currently uses a local stub until the real endpoint is finalized
     """
 
@@ -80,31 +80,44 @@ class LeptageClient:
                 customer_id, amount, currency, return_url
             )
 
-        # TODO: Replace with real Leptage HTTP call once the exact business API
-        #       endpoint and payload format are confirmed from docs.
-        #
-        # Example (pseudo, adjust based on their business API docs):
-        #
-        # path = "/v1/address/deposit"   # WITHOUT /openapi
-        # payload = {
-        #     "amount": str(amount),
-        #     "currency": currency,
-        #     "customerId": customer_id,
-        #     "returnUrl": return_url,
-        # }
-        # headers = get_signed_headers("POST", path, payload)
-        # resp = requests.post(
-        #     f"{self.settings.base_url}{path}",
-        #     json=payload,
-        #     headers=headers,
-        #     timeout=15,
-        # )
-        # resp.raise_for_status()
-        # return resp.json()
-        #
+        # TODO: Replace with real Leptage HTTP call (e.g. /openapi/v1/address/deposit)
         return self._create_payment_stub(
             customer_id, amount, currency, return_url
         )
+
+    def list_deposits(
+        self,
+        page_index: int = 1,
+        page_size: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Call /openapi/v1/txns/deposit using the exact Java demo signing:
+
+        Java:
+          respJson = LeptageApiHttpUtils.postJson("/openapi/v1/txns/deposit", reqJson);
+        """
+        if not self.is_configured():
+            return {"success": False, "error": "Leptage not configured"}
+
+        path = "/openapi/v1/txns/deposit"
+        payload = {
+            "pageIndex": page_index,
+            "pageSize": page_size,
+        }
+
+        headers = get_signed_headers_v2("POST", path, payload)
+
+        base_no_openapi = self.settings.base_url.replace("/openapi", "")
+        full_url = base_no_openapi + path
+
+        resp = requests.post(
+            full_url,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def _create_payment_stub(
         self,
@@ -113,11 +126,11 @@ class LeptageClient:
         currency: str,
         return_url: str,
     ) -> Dict[str, Any]:
-        from datetime import datetime, UTC
+        from datetime import datetime, timezone
 
         fake_payment_id = (
             f"leptage-stub-{customer_id}-"
-            f"{int(datetime.now(UTC).timestamp())}"
+            f"{int(datetime.now(timezone.utc).timestamp())}"
         )
         fake_checkout_url = f"{return_url}?payment_id={fake_payment_id}"
 
@@ -128,12 +141,49 @@ class LeptageClient:
             "amount": amount,
             "currency": currency,
         }
+        
+    
 
     def verify_webhook_signature(self, headers, payload: bytes) -> bool:
         """
         Verify a Leptage webhook signature.
-
-        Note: This method is now a thin wrapper around LeptageWebhookVerifier.
         """
         verifier = get_webhook_verifier()
         return verifier.verify_webhook(headers, payload)
+    
+    
+    
+    def get_deposit_addresses(
+    self,
+    ccy: Optional[str] = None,
+    chain: Optional[str] = None,
+) -> Dict[str, Any]:
+     path = "/v1/address/deposit"          # WITHOUT /openapi
+     url_for_signing = "/openapi" + path   # /openapi/v1/address/deposit
+
+     params = {}
+     if ccy:
+        params["ccy"] = ccy
+     if chain:
+        params["chain"] = chain
+
+    # For signing we pass the full URL including /openapi
+     headers = get_signed_headers_v2("GET", url_for_signing, params if params else None)
+
+    # For actual HTTP call, we append path to base_url
+     url = f"{self.settings.base_url}{path}"
+     if params:
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{url}?{query_string}"
+
+     print(f"[DEBUG] Calling: {url}")
+     print(f"[DEBUG] Headers: {headers}")
+
+     resp = requests.get(url, headers=headers, timeout=15)
+     if resp.status_code >= 400:
+        print(f"[ERROR] Status: {resp.status_code}")
+        print(f"[ERROR] Body: {resp.text}")
+     resp.raise_for_status()
+     return resp.json()
+
+

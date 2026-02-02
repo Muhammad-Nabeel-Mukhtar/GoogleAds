@@ -273,6 +273,61 @@ def get_signed_headers(
     return signer.sign_request(method, path, body_or_params)
 
 
+def get_signed_headers_v2(
+    method: str,
+    url: str,
+    body_or_params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """
+    Strictly mirror Leptage's Java demo signing:
+
+      - url: path including /openapi prefix, e.g. "/openapi/v1/txns/deposit"
+      - GET: signStr = METHOD + url + nonce + (sorted key=value&...)
+      - POST: signStr = METHOD + url + nonce + compact sorted JSON body
+
+    Returns headers:
+      X-API-KEY, X-API-NONCE, X-API-SIGNATURE, Content-Type
+    """
+    api_key = os.getenv("LEPTAGE_API_KEY", "").strip()
+    api_secret = os.getenv("LEPTAGE_API_SECRET", "").strip()
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "[LEPTAGE] LEPTAGE_API_KEY and LEPTAGE_API_SECRET not configured in environment"
+        )
+
+    nonce_ms = int(time.time() * 1000)
+    method_up = method.upper()
+
+    # Build PARAMS string exactly like the Java demo
+    if not body_or_params:
+        params_str = ""
+    else:
+        if method_up == "GET":
+            items = sorted(body_or_params.items(), key=lambda x: x[0])
+            # key=value&key2=value2
+            params_str = "&".join(f"{k}={v}" for k, v in items)
+        else:
+            # POST: compact JSON with sorted keys
+            params_str = json.dumps(body_or_params, separators=(",", ":"), sort_keys=True)
+            print(f"[DEBUG] Compact JSON body: {params_str}")
+
+    sign_str = f"{method_up}{url}{nonce_ms}{params_str}"
+    print(f"[DEBUG] String to sign: {sign_str}")
+
+    # Sign with ECDSA P-256 + SHA256, DER hex
+    signer = LeptageRequestSigner(api_key, api_secret)
+    signature_hex = signer._sign_bytes(sign_str.encode("utf-8"))
+
+    print(f"[DEBUG] Signature (hex): {signature_hex}")
+
+    return {
+        "X-API-KEY": api_key,
+        "X-API-NONCE": str(nonce_ms),
+        "X-API-SIGNATURE": signature_hex,
+        "Content-Type": "application/json",
+    }
+
+
 def get_webhook_verifier() -> LeptageWebhookVerifier:
     """
     Build a webhook verifier instance based on environment and known URL.

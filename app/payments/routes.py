@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 from typing import List
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 
 from flask import jsonify, request, current_app
 
 from . import payments_bp
-from .models import payment_store
 from .leptage_client import LeptageClient
 from .leptage_signing import get_webhook_verifier
+from .models import Payment
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @payments_bp.route("/payments", methods=["POST"])
@@ -24,25 +24,28 @@ def create_payment():
 
     Body:
     {
-      "customer_id": "1234567890",
-      "amount": 1000,
-      "currency": "USDT"  # optional, default comes from YAML
+      "amount": 100.0,
+      "ccy": "USDT",          # optional, default from config
+      "chain": "ETHEREUM"     # optional, default ETHEREUM
     }
+
+    This does NOT create a Leptage checkout session.
+    It just:
+      - Gets your deposit address from Leptage (for ccy/chain)
+      - Creates a local Payment record in Mongo
+      - Returns payment_id + address to the frontend
     """
     data = request.get_json(silent=True) or {}
-    customer_id = str(data.get("customer_id", "")).strip()
     amount_raw = data.get("amount")
 
     cfg = current_app.config.get("LEPTAGE_CONFIG", {})
     payments_cfg = cfg.get("payments", {})
     default_currency = payments_cfg.get("currency_default", "USDT")
 
-    currency = str(data.get("currency", default_currency)).strip().upper()
+    ccy = str(data.get("ccy", default_currency)).strip().upper()
+    chain = str(data.get("chain", "ETHEREUM")).strip().upper()
 
     errors: List[str] = []
-
-    if not customer_id or not customer_id.isdigit():
-        errors.append("Valid numeric customer_id is required.")
 
     try:
         amount = float(amount_raw)
@@ -54,33 +57,39 @@ def create_payment():
     if errors:
         return jsonify({"success": False, "errors": errors}), 400
 
-    success_path = payments_cfg.get("success_path", "/payment-success")
-    return_url = request.host_url.rstrip("/") + success_path
-
+    # 1) Get deposit address from Leptage
     client = LeptageClient()
-    payment_resp = client.create_payment(
-        customer_id=customer_id,
-        amount=amount,
-        currency=currency,
-        return_url=return_url,
-    )
+    try:
+        addr_resp = client.get_deposit_addresses(ccy=ccy, chain=chain)
+    except Exception as e:
+        current_app.logger.exception("Error calling get_deposit_addresses")
+        return jsonify({"success": False, "errors": [f"Leptage error: {e}"]}), 502
 
-    # Here, payment_resp["id"] is Leptage's id or stub id
-    record = payment_store.create_payment(
-        gateway_id=payment_resp["id"],
-        customer_id=customer_id,
+    addresses = addr_resp.get("data") or []
+    if not addresses:
+        return jsonify(
+            {"success": False, "errors": ["No deposit address available."]}
+        ), 500
+
+    address = addresses[0]["address"]
+
+    # 2) Create local Payment record (no customer/campaign linkage for now)
+    payment = Payment.create(
+        campaign_id="generic_deposit",
         amount=amount,
-        currency=currency,
+        ccy=ccy,
+        chain=chain,
     )
 
     return jsonify(
         {
             "success": True,
-            "payment_id": payment_resp["id"],
-            "authorization_url": payment_resp["checkout_url"],
+            "payment_id": payment.id,
             "amount": amount,
-            "currency": currency,
-            "record": record,
+            "ccy": ccy,
+            "chain": chain,
+            "address": address,
+            "status": payment.status,
             "timestamp": _now_iso(),
         }
     ), 201
@@ -90,21 +99,27 @@ def create_payment():
 def get_payment_status(payment_id: str):
     """
     GET /api/payments/<payment_id>/status
+
+    Frontend polls this to see if the deposit is confirmed.
     """
-    record = payment_store.get_payment(payment_id)
-    if not record:
-        return jsonify({"success": False, "errors": ["Payment not found."]}), 404
+    payment = Payment.get_by_id(payment_id)
+    if not payment:
+        return jsonify(
+            {"success": False, "errors": ["Payment not found."]}
+        ), 404
 
     return jsonify(
         {
             "success": True,
-            "payment_id": payment_id,
-            "status": record["status"],
-            "amount": record["amount"],
-            "currency": record["currency"],
-            "customer_id": record["customer_id"],
-            "created_at": record["created_at"],
-            "updated_at": record["updated_at"],
+            "payment_id": payment.id,
+            "status": payment.status,
+            "amount": payment.amount,
+            "ccy": payment.ccy,
+            "chain": payment.chain,
+            "leptage_txn_id": payment.leptage_txn_id,
+            "customer_wallet": payment.customer_wallet,
+            "created_at": payment.created_at.isoformat(),
+            "updated_at": payment.updated_at.isoformat(),
         }
     ), 200
 
@@ -114,7 +129,26 @@ def leptage_webhook():
     """
     POST /api/webhooks/leptage
 
-    Verifies Leptage webhook using HMAC-SHA256 as per docs, then updates state.
+    Verifies Leptage webhook using HMAC-SHA256 as per docs,
+    then updates local Payment status.
+
+    Expecting payload similar to /v1/txns/deposit response schema:
+    {
+      "code": "0000",
+      "msg": "succeed",
+      "data": {
+        "txnId": "...",
+        "ccy": "USDT",
+        "amount": "30000.000000",
+        "status": "SUCCEEDED",
+        "createdAt": 1735892447000,
+        "type": "FUNDS_IN",
+        "chainInfo": {...},
+        "payer": {...},
+        "accountId": "..."
+      }
+    }
+    or just the inner "data" object.
     """
     raw_body = request.get_data()
     headers = request.headers
@@ -125,16 +159,51 @@ def leptage_webhook():
         return jsonify({"success": False, "error": "Invalid signature"}), 401
 
     payload = request.get_json(silent=True) or {}
-    event = payload.get("event")
-    data = payload.get("data") or {}
 
-    # Adjust mapping once you know Leptage's exact webhook payload schema.
-    gateway_id = data.get("transaction_id") or data.get("id")
+    # Some implementations wrap the object in { code, msg, data }, some send data directly.
+    data = payload.get("data") or payload
+
+    txn_id = data.get("txnId")
+    ccy = data.get("ccy")
+    amount_str = data.get("amount")
     status = data.get("status")
+    chain_info = data.get("chainInfo") or {}
+    payer = data.get("payer") or {}
 
-    print(f"[LEPTAGE WEBHOOK] event={event}, id={gateway_id}, status={status}")
+    print(
+        f"[LEPTAGE WEBHOOK] txn_id={txn_id}, ccy={ccy}, amount={amount_str}, status={status}"
+    )
 
-    if gateway_id and status:
-        payment_store.update_status(gateway_id, str(status).upper())
+    try:
+        amount = float(amount_str) if amount_str is not None else None
+    except (TypeError, ValueError):
+        amount = None
+
+    # Simple strategy for now:
+    # - You only care about "deposit to our account".
+    # - Match by latest PENDING payment for this currency.
+    payment = None
+    if ccy:
+        payment = Payment.get_latest_pending_for_ccy(ccy)
+
+    if not payment:
+        print("[LEPTAGE WEBHOOK] No matching local payment found; ignoring.")
+        return jsonify({"success": True}), 200
+
+    status_upper = str(status).upper() if status else ""
+
+    if status_upper == "SUCCEEDED":
+        source_addr = payer.get("sourceAddress") or chain_info.get("sourceAddress")
+        payment.update_status(
+            "CONFIRMED",
+            leptage_txn_id=txn_id,
+            customer_wallet=source_addr,
+        )
+        print(f"[LEPTAGE WEBHOOK] Payment {payment.id} confirmed.")
+    elif status_upper == "FAILED":
+        payment.update_status("FAILED", leptage_txn_id=txn_id)
+        print(f"[LEPTAGE WEBHOOK] Payment {payment.id} failed.")
+    else:
+        print(f"[LEPTAGE WEBHOOK] Status {status} not handled explicitly.")
 
     return jsonify({"success": True}), 200

@@ -3,7 +3,7 @@
 leptage:
   # Which environment to use: "uat" (test) or "production"
   env: "uat"
-
+  member_id: "ACC1976166244839202816" 
   # Base URLs for each environment (from Leptage docs)
   base_urls:
     uat: "https://api1.uat.planckage.cc/openapi"
@@ -23,7 +23,7 @@ payments:
   currency_default: "USDT"
 
   # (Optional) default chain if you later add chain support
-  chain_default: "ethereum"
+  chain_default: "tron"
 
   # Frontend success redirect path after payment
   success_path: "/payment-success"
